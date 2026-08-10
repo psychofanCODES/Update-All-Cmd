@@ -96,6 +96,7 @@ update-all [options]
 | Option | What it does |
 | --- | --- |
 | `--dry-run` | Prints the update commands without intentionally applying updates. |
+| `-a`, `--all` | Answers yes to all optional safety and cleanup prompts for this run. |
 | `--no-anim` | Disables animated header/scanner effects. |
 | `--no-color` | Disables ANSI color output. |
 | `-h`, `--help` | Shows command help. |
@@ -110,6 +111,9 @@ update-all --dry-run
 
 # Run the workstation update sweep
 update-all
+
+# Run the update sweep and auto-approve all optional prompts
+update-all --all
 
 # Quiet log-friendly output
 update-all --no-anim --no-color
@@ -132,7 +136,7 @@ Current pending-update list support:
 
 Homebrew also gets a tap-trust preflight before `brew update`. A Homebrew `tap` is an extra package source, like an added shelf outside the default store. If Homebrew marks a third-party tap as `Untrusted`, `update-all` shows an `INSIGHT` panel that says what this means in plain English: Homebrew cannot prove who controls that source. It is a provenance warning, not proof of malware and not an expired-license warning.
 
-`brew untap ...` removes that extra package source from Homebrew so future `brew` runs stop reading it. It does not delete your projects or random files. Homebrew may refuse to untap when installed tools still depend on that source, which is a useful safety stop. The recommended gold standard is to remove unused or unrecognized untrusted taps, and keep one only when you intentionally need it and trust its source. `update-all` shows the exact `brew untap ...` command and asks for any removal decision before the update sweep starts. Typing `a` or `all` at the first optional prompt also answers yes to remaining Homebrew tap prompts.
+`brew untap ...` removes that extra package source from Homebrew so future `brew` runs stop reading it. It does not delete your projects or random files. Homebrew may refuse to untap when installed tools still depend on that source, which is a useful safety stop. The recommended gold standard is to remove unused or unrecognized untrusted taps, and keep one only when you intentionally need it and trust its source. `update-all` shows the exact `brew untap ...` command and asks for any removal decision before the update sweep starts. Typing `a` or `all` at the first optional prompt answers yes to remaining Homebrew tap prompts, or you can pass `--all` once for the entire run.
 
 Other package managers still stream their native update output and are tracked in the final receipt. Broader registry-backed package discovery belongs to planned Safety Coach Mode.
 

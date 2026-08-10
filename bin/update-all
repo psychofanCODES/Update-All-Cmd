@@ -42,17 +42,18 @@ usage() {
 update-all - local workstation updater
 
 Usage:
-  update-all [--dry-run] [--no-anim] [--no-color] [-h|--help]
+  update-all [--dry-run] [--no-anim] [--no-color] [-a|--all] [-h|--help]
 
 Options:
   --dry-run   Print each update command instead of running it.
   --no-anim   Disable terminal animations.
   --no-color  Disable ANSI colors.
+  -a, --all   Answer yes to all optional prompts in this run.
   -h, --help  Show this help.
 
 Interactive:
   At optional live prompts, type a or all once to answer yes to every remaining
-  optional question in that run.
+  optional question in that run, or use -a/--all from the command line.
 
 Environment:
   UPDATE_ALL_COREPACK_TIMEOUT=90s  Timeout for corepack commands.
@@ -68,6 +69,9 @@ parse_args() {
     case "$1" in
       --dry-run)
         UPDATE_ALL_DRY_RUN=1
+        ;;
+      -a|--all)
+        _ua_answer_all_choice="yes"
         ;;
       --no-anim)
         UPDATE_ALL_ANIM=0
