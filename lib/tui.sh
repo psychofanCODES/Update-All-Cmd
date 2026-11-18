@@ -63,7 +63,9 @@ _tui_truncate_var() {
 
 tui_query_size() {
   local sz="" r="" c=""
-  [ -r /dev/tty ] && sz="$(stty size </dev/tty 2>/dev/null || true)"
+  if { [ -t 0 ] || [ -t 1 ]; } && [ -r /dev/tty ]; then
+    sz="$({ stty size </dev/tty; } 2>/dev/null || true)"
+  fi
   if [ -n "$sz" ]; then r="${sz%% *}"; c="${sz#* }"; fi
   case "$r" in *[!0-9]*|"") r="" ;; esac
   case "$c" in *[!0-9]*|"") c="" ;; esac

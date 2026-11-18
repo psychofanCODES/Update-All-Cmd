@@ -44,6 +44,7 @@ _ua_probe_bounded() {
 }
 
 augment_safe_path() {
+  [ "${UPDATE_ALL_NO_PATH_AUGMENT:-0}" = 1 ] && return 0
   local dir
   for dir in \
     "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.bun/bin" "$HOME/.deno/bin" \

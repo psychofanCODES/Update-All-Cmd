@@ -6,6 +6,7 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPDATE_ALL="$ROOT_DIR/bin/update-all"
 DIST_BUNDLE="$ROOT_DIR/dist/update-all"
+export UPDATE_ALL_NO_PATH_AUGMENT=1
 
 PASS_COUNT=0
 FAIL_COUNT=0

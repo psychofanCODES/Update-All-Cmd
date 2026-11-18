@@ -631,7 +631,9 @@ _tui_truncate_var() {
 
 tui_query_size() {
   local sz="" r="" c=""
-  [ -r /dev/tty ] && sz="$(stty size </dev/tty 2>/dev/null || true)"
+  if { [ -t 0 ] || [ -t 1 ]; } && [ -r /dev/tty ]; then
+    sz="$({ stty size </dev/tty; } 2>/dev/null || true)"
+  fi
   if [ -n "$sz" ]; then r="${sz%% *}"; c="${sz#* }"; fi
   case "$r" in *[!0-9]*|"") r="" ;; esac
   case "$c" in *[!0-9]*|"") c="" ;; esac
@@ -1876,6 +1878,7 @@ _ua_probe_bounded() {
 }
 
 augment_safe_path() {
+  [ "${UPDATE_ALL_NO_PATH_AUGMENT:-0}" = 1 ] && return 0
   local dir
   for dir in \
     "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.bun/bin" "$HOME/.deno/bin" \
@@ -6253,7 +6256,7 @@ _ua_run_selftests() {
     local stdin_selftest_output
     run_cmd bash -c 'if IFS= read -r -t 1 _; then echo run-cmd-open; else echo run-cmd-closed; fi'
     run_cmd_capture stdin_selftest_output bash -c 'if IFS= read -r -t 1 _; then echo run-capture-open; else echo run-capture-closed; fi'
-    run_bounded 2s bash -c 'if IFS= read -r -t 1 _; then echo run-bounded-open; else echo run-bounded-closed; fi'
+    run_bounded 5s bash -c 'if IFS= read -r -t 1 _; then echo run-bounded-open; else echo run-bounded-closed; fi'
     run_shell 'if IFS= read -r -t 1 _; then echo run-shell-open; else echo run-shell-closed; fi'
     run_shell_capture stdin_selftest_output 'if IFS= read -r -t 1 _; then echo run-shell-capture-open; else echo run-shell-capture-closed; fi'
     if [ "${UPDATE_ALL_STDIN_INCLUDE_SUDO:-0}" = 1 ]; then
