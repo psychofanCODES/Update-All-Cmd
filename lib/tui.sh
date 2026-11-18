@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # lib/tui.sh - Persistent DECSTBM 2-row TUI dock, kinetic watcher, and EWMA ETA store.
 # Bash 3.2+ parse-compatible; sourced by bin/update-all.
+# Cross-module TUI state and palette globals are shared with bin/update-all and lib/runner.sh.
+# shellcheck disable=SC2034,SC2154
 
 UPDATE_ALL_ANIM="${UPDATE_ALL_ANIM:-1}"
 UPDATE_ALL_DRY_RUN="${UPDATE_ALL_DRY_RUN:-0}"
@@ -250,9 +252,9 @@ timings_save() {
   [ "${UPDATE_ALL_DRY_RUN:-0}" = "0" ] || return 0
   local file="${1:-${UPDATE_ALL_TIMINGS_FILE:-}}" dir="" tmp="" i=0 n="${#_ua_timing_keys[@]}"
   [ -n "$file" ] && [ "$n" -gt 0 ] || return 0
-  dir="$(dirname "$file")"
+  dir="$(dirname -- "$file")"
   mkdir -p -- "$dir" 2>/dev/null || return 0
-  tmp="${file}.tmp.$$"
+  tmp="$(mktemp "${dir}/.timings.XXXXXX" 2>/dev/null || printf '%s.tmp.%s' "$file" "$$")"
   if { for ((i = 0; i < n; i++)); do printf '%s\t%s\n' "${_ua_timing_keys[$i]}" "${_ua_timing_secs[$i]}"; done; } > "$tmp" 2>/dev/null; then
     mv -f -- "$tmp" "$file" 2>/dev/null || rm -f -- "$tmp" 2>/dev/null || true
   else
@@ -320,7 +322,9 @@ tui_calc_progress_pct() { _tui_update_progress "${1:-0}"; printf '%s' "$_ua_tui_
 
 tui_set_phase() {
   _ua_tui_phase="$1"
-  [ "${_ua_tui_active:-0}" -eq 1 ] && [ "${_ua_tui_paused:-0}" -eq 0 ] && tui_draw_dock 0 0 0 1 || true
+  if [ "${_ua_tui_active:-0}" -eq 1 ] && [ "${_ua_tui_paused:-0}" -eq 0 ]; then
+    tui_draw_dock 0 0 0 1 || true
+  fi
 }
 
 tui_step_begin() {
@@ -329,7 +333,9 @@ tui_step_begin() {
   if [ -n "$idx" ]; then _ua_tui_step_index="$idx"; else _ua_tui_step_index=$(( _ua_tui_step_index + 1 )); fi
   [ -n "$total" ] && _ua_tui_step_total="$total"
   _tui_now_s _ua_tui_step_start_s
-  [ "${_ua_tui_active:-0}" -eq 1 ] && [ "${_ua_tui_paused:-0}" -eq 0 ] && tui_draw_dock 0 0 0 1 || true
+  if [ "${_ua_tui_active:-0}" -eq 1 ] && [ "${_ua_tui_paused:-0}" -eq 0 ]; then
+    tui_draw_dock 0 0 0 1 || true
+  fi
 }
 
 tui_step_end() {
@@ -346,7 +352,9 @@ tui_step_end() {
   fi
   if [ "$status" = "SKIP" ]; then _timings_mark_done "$key"; else timings_record_step "$key" "$actual"; fi
   [ "${_ua_tui_step_key:-}" = "$key" ] && _ua_tui_step_key=""
-  [ "${_ua_tui_active:-0}" -eq 1 ] && [ "${_ua_tui_paused:-0}" -eq 0 ] && tui_draw_dock 0 0 0 0 || true
+  if [ "${_ua_tui_active:-0}" -eq 1 ] && [ "${_ua_tui_paused:-0}" -eq 0 ]; then
+    tui_draw_dock 0 0 0 0 || true
+  fi
 }
 
 _tui_apply_scroll_region() {

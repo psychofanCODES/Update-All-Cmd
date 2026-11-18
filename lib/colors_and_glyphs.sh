@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # lib/colors_and_glyphs.sh - Color palette, monochrome glyphs, banners, and tool cards.
 # Bash 3.2+ parse-compatible; sourced by bin/update-all.
+# Cross-module palette and glyph globals are consumed by bin/update-all and sibling libs.
+# shellcheck disable=SC2034,SC2154
 
 glyphs_init() {
   local locale="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
@@ -206,7 +208,11 @@ section() {
   local label="$1" heading
   heading="$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]')"
   printf '\n'
-  printf '%b╾────%b %b%s%b %b────╼%b\n' "$C_FRAME" "$C_RESET" "$C_UNIT" "$heading" "$C_RESET" "$C_FRAME" "$C_RESET"
+  if [ "${_ua_utf8:-1}" -eq 1 ]; then
+    printf '%b╾────%b %b%s%b %b────╼%b\n' "$C_FRAME" "$C_RESET" "$C_UNIT" "$heading" "$C_RESET" "$C_FRAME" "$C_RESET"
+  else
+    printf '%b----%b %b%s%b %b----%b\n' "$C_FRAME" "$C_RESET" "$C_UNIT" "$heading" "$C_RESET" "$C_FRAME" "$C_RESET"
+  fi
   printf '\n'
 }
 

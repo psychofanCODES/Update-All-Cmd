@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
 # Safety Coach: Homebrew tap trust (cached), OSV malicious/advisory package audit,
 # read-only exposed-port audit, and guided post-receipt remediation walkthrough.
 # Public-safe: zero hardcoded user paths, private IPs, or secrets.
@@ -6,20 +7,19 @@
 : "${UPDATE_ALL_SECURITY_SCAN:=1}"
 : "${UPDATE_ALL_NONINTERACTIVE:=0}"
 : "${UPDATE_ALL_OSV_MOCK_FILE:=}"
+: "${UPDATE_ALL_OSV_TUPLES_MOCK_FILE:=}"
+: "${UPDATE_ALL_OSV_VULN_MOCK_DIR:=}"
 : "${UPDATE_ALL_PORTS_MOCK_FILE:=}"
 : "${_ua_brew_trust_inspected:=0}"
 : "${_ua_brew_preflight_shown:=0}"
 : "${_ua_count_security:=0}"
-: "${G_UPDATED:=↗}"
 : "${G_OK:=✓}"
-: "${G_UNCHANGED:==}"
 : "${G_FAIL:=✗}"
 : "${G_SKIP:=·}"
 : "${G_WARN:=▲}"
 : "${G_SAFETY:=◆}"
 : "${G_ARROW:=→}"
 : "${G_GUTTER:=│}"
-: "${G_CARD:=▌}"
 
 if ! declare -p _ua_sec_kind >/dev/null 2>&1; then
   declare -a _ua_sec_kind=()
@@ -52,7 +52,7 @@ add_security_finding() {
   _ua_sec_remedy_desc+=("$remedy_desc")
   _ua_sec_remedy_cmd+=("$remedy_cmd")
   _ua_sec_alt_cmd+=("$alt_cmd")
-  _ua_count_security=$(( ${_ua_count_security:-0} + 1 ))
+  _ua_count_security=$(( _ua_count_security + 1 ))
 
   if declare -F add_concern >/dev/null 2>&1; then
     add_concern \
@@ -60,6 +60,21 @@ add_security_finding() {
       "$summary" \
       "${remedy_desc}${remedy_cmd:+ Command: ${remedy_cmd}}"
   fi
+}
+
+_safety_valid_pkg_token() {
+  local re='^[A-Za-z0-9@][A-Za-z0-9@._/+:-]*$'
+  [[ "$1" =~ $re ]]
+}
+
+_safety_valid_brew_tap() {
+  local re='^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
+  [[ "$1" =~ $re ]]
+}
+
+_safety_valid_osv_id() {
+  local re='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+  [[ "$1" =~ $re ]]
 }
 
 brew_tap_index() {
@@ -95,6 +110,9 @@ inspect_brew_tap_trust() {
 
   while IFS= read -r tap; do
     [ -n "$tap" ] || continue
+    if ! _safety_valid_brew_tap "$tap"; then
+      continue
+    fi
     _ua_brew_all_taps+=("$tap")
     if declare -F run_probe_bounded >/dev/null 2>&1; then
       info="$(run_probe_bounded "${UPDATE_ALL_PROBE_TIMEOUT:-15s}" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew tap-info "$tap" || true)"
@@ -135,9 +153,14 @@ insight_row() {
 
 print_brew_tap_insight() {
   local tap="$1" source="${2:-}" installed_from_tap="${3:-}" item
+  local top_corner="╭─" bot_corner="╰─"
+  if [ "${_ua_utf8:-1}" -eq 0 ]; then
+    top_corner="+-"
+    bot_corner="+-"
+  fi
 
-  printf '\n  %b╭─%b %bINSIGHT%b %bHomebrew trust warning%b\n' \
-    "${C_FRAME:-}" "${C_RESET:-}" "${C_ORANGE:-}" "${C_RESET:-}" "${C_HEADER:-}" "${C_RESET:-}"
+  printf '\n  %b%s%b %bINSIGHT%b %bHomebrew trust warning%b\n' \
+    "${C_FRAME:-}" "$top_corner" "${C_RESET:-}" "${C_ORANGE:-}" "${C_RESET:-}" "${C_HEADER:-}" "${C_RESET:-}"
   printf '  %b%s%b\n' "${C_FRAME:-}" "$G_GUTTER" "${C_RESET:-}"
   insight_row "$G_WARN" "Signal" "Homebrew marks this tap as Untrusted: $tap" "${C_WARN:-}"
   insight_row "?" "Tap" "A tap is an extra Homebrew package source, like an added shelf outside the default store." "${C_LABEL:-}"
@@ -158,12 +181,12 @@ print_brew_tap_insight() {
     insight_row "$G_ARROW" "Action" "Recommended: untap it now. Unused untrusted taps should not stay in your update path." "${C_OK:-}"
   fi
   insight_row "$" "Command" "brew untap $tap" "${C_CMD:-}"
-  printf '  %b╰─%b %bPlain English:%b scary word, boring rule: unknown package sources deserve review.\n' \
-    "${C_FRAME:-}" "${C_RESET:-}" "${C_HEADER:-}" "${C_RESET:-}"
+  printf '  %b%s%b %bPlain English:%b scary word, boring rule: unknown package sources deserve review.\n' \
+    "${C_FRAME:-}" "$bot_corner" "${C_RESET:-}" "${C_HEADER:-}" "${C_RESET:-}"
 }
 
 show_brew_tap_trust_preflight() {
-  local i tap idx untrusted_count=0 remove_code=0
+  local i tap idx untrusted_count=0 remove_code=0 tap_remedy_cmd="" tap_alt_cmd=""
 
   _ua_brew_preflight_shown=1
   inspect_brew_tap_trust
@@ -184,6 +207,9 @@ show_brew_tap_trust_preflight() {
 
   for ((i = 0; i < ${#_ua_brew_all_taps[@]}; i++)); do
     tap="${_ua_brew_all_taps[$i]}"
+    if ! _safety_valid_brew_tap "$tap"; then
+      continue
+    fi
     idx="$(brew_tap_index "$tap" 2>/dev/null || true)"
     if [ -n "$idx" ]; then
       untrusted_count=$((untrusted_count + 1))
@@ -209,6 +235,12 @@ show_brew_tap_trust_preflight() {
         fi
       else
         printf '%bKEEP%b %s left installed by upfront choice.\n' "${C_WARN:-}" "${C_RESET:-}" "$tap"
+        tap_remedy_cmd=""
+        tap_alt_cmd=""
+        if _safety_valid_brew_tap "$tap"; then
+          tap_remedy_cmd="brew untap $tap"
+          tap_alt_cmd="brew tap-info $tap"
+        fi
         add_security_finding \
           "UNTRUSTED TAP" \
           "WARN" \
@@ -216,8 +248,8 @@ show_brew_tap_trust_preflight() {
           "BREW-UNTRUSTED-TAP" \
           "The untrusted Homebrew tap $tap stayed in your update path because the upfront answer was no. Keep it only if you recognize and trust its maintainer." \
           "Remove this tap if unused or unfamiliar." \
-          "brew untap $tap" \
-          "brew tap-info $tap"
+          "$tap_remedy_cmd" \
+          "$tap_alt_cmd"
       fi
     else
       pending_update_note "$tap: no untrusted marker reported"
@@ -241,11 +273,6 @@ _safety_json_escape() {
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
   printf '%s' "$s"
-}
-
-_safety_valid_pkg_token() {
-  local re='^[A-Za-z0-9@._/+:-]+$'
-  [[ "$1" =~ $re ]]
 }
 
 _safety_osv_remedy_for() {
@@ -366,70 +393,239 @@ _safety_collect_osv_tuples() {
   fi
 }
 
-_safety_parse_osv_json() {
+_safety_parse_osv_batch() {
   local json_text="$1"
   if command -v python3 >/dev/null 2>&1; then
     printf '%s' "$json_text" | python3 -c '
 import json, sys
+
+def cvss_to_sev(score):
+    try:
+        val = float(score)
+    except (TypeError, ValueError):
+        return ""
+    if val >= 9.0:
+        return "CRITICAL"
+    if val >= 7.0:
+        return "HIGH"
+    if val >= 4.0:
+        return "MODERATE"
+    if val > 0.0:
+        return "LOW"
+    return ""
+
+def extract_sev(v):
+    db = v.get("database_specific")
+    if isinstance(db, dict):
+        if db.get("severity"):
+            return str(db.get("severity")).upper().strip()
+        cvss = db.get("cvss")
+        if isinstance(cvss, dict) and cvss.get("score") is not None:
+            s = cvss_to_sev(cvss.get("score"))
+            if s:
+                return s
+    for a in (v.get("affected") or []):
+        if not isinstance(a, dict):
+            continue
+        for key in ("database_specific", "ecosystem_specific"):
+            sub = a.get(key)
+            if isinstance(sub, dict) and sub.get("severity"):
+                return str(sub.get("severity")).upper().strip()
+    best = ""
+    order = {"": 0, "LOW": 1, "MEDIUM": 2, "MODERATE": 2, "HIGH": 3, "CRITICAL": 4}
+    for sev_obj in (v.get("severity") or []):
+        if isinstance(sev_obj, dict):
+            s = cvss_to_sev(sev_obj.get("score"))
+            if order.get(s, 0) > order.get(best, 0):
+                best = s
+    return best
+
 try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
 results = data.get("results") or []
 for idx, entry in enumerate(results):
+    if not isinstance(entry, dict):
+        continue
     for v in (entry.get("vulns") or []):
+        if not isinstance(v, dict):
+            continue
         vid = str(v.get("id") or "").strip()
         if not vid:
             continue
-        summary = str(v.get("summary") or v.get("details") or "Security advisory reported by OSV.").replace("\n", " ").replace("|", "/")[:180].strip()
-        sev = ""
-        db = v.get("database_specific") or {}
-        if isinstance(db, dict) and db.get("severity"):
-            sev = str(db.get("severity")).upper()
+        raw_sum = str(v.get("summary") or v.get("details") or "")
+        summary = " ".join(raw_sum.replace("|", "/").split())[:180].strip()
+        sev = extract_sev(v)
         if vid.startswith("MAL-"):
             sev = "CRITICAL"
-        if sev in ("LOW", "MODERATE", "MEDIUM"):
-            continue
-        if not sev:
-            if vid.startswith("GHSA-") or vid.startswith("CVE-"):
-                sev = "HIGH"
-            else:
-                continue
-        if sev not in ("CRITICAL", "HIGH"):
-            continue
+        needs_hydrate = "1" if (not summary or not sev) else "0"
         aff_pkg = ""
         aff_eco = ""
         for a in (v.get("affected") or []):
-            p = (a.get("package") or {})
-            if p.get("name"):
+            if not isinstance(a, dict):
+                continue
+            p = a.get("package") or {}
+            if isinstance(p, dict) and p.get("name"):
                 aff_pkg = str(p.get("name"))
                 aff_eco = str(p.get("ecosystem") or "")
                 break
-        print(f"{idx}|{vid}|{sev}|{aff_pkg}|{aff_eco}|{summary}")
+        print(f"{idx}|{vid}|{sev}|{needs_hydrate}|{aff_pkg}|{aff_eco}|{summary}")
 ' 2>/dev/null || true
     return 0
   fi
 
-  # Minimal pure-awk fallback if python3 is unavailable
-  printf '%s\n' "$json_text" | awk '
-    BEGIN { idx = -1 }
-    /"vulns"/ { idx++ }
-    /"id"[[:space:]]*:/ {
-      line = $0
-      sub(/^.*"id"[[:space:]]*:[[:space:]]*"/, "", line)
-      sub(/".*$/, "", line)
-      if (line ~ /^MAL-/) {
-        printf "%d|%s|CRITICAL|||OpenSSF Malicious Package match reported by OSV.\n", (idx < 0 ? 0 : idx), line
-      } else if (line ~ /^(GHSA-|CVE-)/) {
-        printf "%d|%s|HIGH|||Security advisory reported by OSV.\n", (idx < 0 ? 0 : idx), line
-      }
-    }
-  '
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json_text" | jq -r '
+      def norm_sev:
+        if type == "string" then ascii_upcase | gsub("^\\s+|\\s+$"; "") else "" end;
+      def cvss_num($val):
+        if ($val | type) == "number" then $val
+        elif ($val | type) == "string" and ($val | test("^[0-9]+(\\.[0-9]+)?$")) then ($val | tonumber)
+        else empty end;
+      def cvss_sev($arr; $db_score):
+        ([($arr[]? | cvss_num(.score?)), cvss_num($db_score)] | max) as $m |
+        if $m == null then ""
+        elif $m >= 9.0 then "CRITICAL"
+        elif $m >= 7.0 then "HIGH"
+        elif $m >= 4.0 then "MODERATE"
+        elif $m > 0 then "LOW"
+        else "" end;
+      def extract_sev($v):
+        (($v.database_specific.severity? // "" | norm_sev) as $s1 |
+         if $s1 != "" then $s1
+         else ([$v.affected[]? | (.database_specific.severity? // .ecosystem_specific.severity? // empty)] | first // "" | norm_sev) as $s2 |
+           if $s2 != "" then $s2
+           else cvss_sev(($v.severity // []); ($v.database_specific.cvss.score? // null))
+           end
+         end);
+      (.results // []) | to_entries[] | .key as $idx | (.value.vulns // [])[] |
+      (.id // "" | tostring) as $vid |
+      select($vid != "") |
+      (if ($vid | startswith("MAL-")) then "CRITICAL" else extract_sev(.) end) as $sev |
+      ((.summary // .details // "") | tostring | gsub("[\r\n\t]+"; " ") | gsub("\\|"; "/") | gsub("^ +| +$"; "") | .[0:180]) as $sum |
+      (if ($sum == "" or $sev == "") then "1" else "0" end) as $need |
+      ((.affected // [])[0].package.name? // "" | tostring) as $pkg |
+      ((.affected // [])[0].package.ecosystem? // "" | tostring) as $eco |
+      "\($idx)|\($vid)|\($sev)|\($need)|\($pkg)|\($eco)|\($sum)"
+    ' 2>/dev/null || true
+    return 0
+  fi
+
+  return 1
+}
+
+_safety_parse_osv_vuln() {
+  local json_text="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$json_text" | python3 -c '
+import json, sys
+
+def cvss_to_sev(score):
+    try:
+        val = float(score)
+    except (TypeError, ValueError):
+        return ""
+    if val >= 9.0:
+        return "CRITICAL"
+    if val >= 7.0:
+        return "HIGH"
+    if val >= 4.0:
+        return "MODERATE"
+    if val > 0.0:
+        return "LOW"
+    return ""
+
+try:
+    v = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(v, dict):
+    sys.exit(0)
+
+sev = ""
+db = v.get("database_specific")
+if isinstance(db, dict):
+    if db.get("severity"):
+        sev = str(db.get("severity")).upper().strip()
+    elif isinstance(db.get("cvss"), dict) and db["cvss"].get("score") is not None:
+        sev = cvss_to_sev(db["cvss"].get("score"))
+if not sev:
+    for a in (v.get("affected") or []):
+        if not isinstance(a, dict):
+            continue
+        for key in ("database_specific", "ecosystem_specific"):
+            sub = a.get(key)
+            if isinstance(sub, dict) and sub.get("severity"):
+                sev = str(sub.get("severity")).upper().strip()
+                break
+        if sev:
+            break
+if not sev:
+    order = {"": 0, "LOW": 1, "MEDIUM": 2, "MODERATE": 2, "HIGH": 3, "CRITICAL": 4}
+    for sev_obj in (v.get("severity") or []):
+        if isinstance(sev_obj, dict):
+            s = cvss_to_sev(sev_obj.get("score"))
+            if order.get(s, 0) > order.get(sev, 0):
+                sev = s
+
+raw_sum = str(v.get("summary") or v.get("details") or "")
+summary = " ".join(raw_sum.replace("|", "/").split())[:180].strip()
+aff_pkg = ""
+aff_eco = ""
+for a in (v.get("affected") or []):
+    if not isinstance(a, dict):
+        continue
+    p = a.get("package") or {}
+    if isinstance(p, dict) and p.get("name"):
+        aff_pkg = str(p.get("name"))
+        aff_eco = str(p.get("ecosystem") or "")
+        break
+print(f"{sev}|{aff_pkg}|{aff_eco}|{summary}")
+' 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json_text" | jq -r '
+      def norm_sev:
+        if type == "string" then ascii_upcase | gsub("^\\s+|\\s+$"; "") else "" end;
+      def cvss_num($val):
+        if ($val | type) == "number" then $val
+        elif ($val | type) == "string" and ($val | test("^[0-9]+(\\.[0-9]+)?$")) then ($val | tonumber)
+        else empty end;
+      def cvss_sev($arr; $db_score):
+        ([($arr[]? | cvss_num(.score?)), cvss_num($db_score)] | max) as $m |
+        if $m == null then ""
+        elif $m >= 9.0 then "CRITICAL"
+        elif $m >= 7.0 then "HIGH"
+        elif $m >= 4.0 then "MODERATE"
+        elif $m > 0 then "LOW"
+        else "" end;
+      ((.database_specific.severity? // "" | norm_sev) as $s1 |
+       if $s1 != "" then $s1
+       else ([.affected[]? | (.database_specific.severity? // .ecosystem_specific.severity? // empty)] | first // "" | norm_sev) as $s2 |
+         if $s2 != "" then $s2
+         else cvss_sev((.severity // []); (.database_specific.cvss.score? // null))
+         end
+       end) as $sev |
+      ((.summary // .details // "") | tostring | gsub("[\r\n\t]+"; " ") | gsub("\\|"; "/") | gsub("^ +| +$"; "") | .[0:180]) as $sum |
+      ((.affected // [])[0].package.name? // "" | tostring) as $pkg |
+      ((.affected // [])[0].package.ecosystem? // "" | tostring) as $eco |
+      "\($sev)|\($pkg)|\($eco)|\($sum)"
+    ' 2>/dev/null || true
+    return 0
+  fi
+
+  return 1
 }
 
 scan_osv_packages() {
-  local payload="" i max_q=150 response="" parsed=""
-  local idx vid sev aff_pkg aff_eco summary pkg mgr ver kind rcmd acmd found=0 is_mal=0
+  local payload="" i max_q=150 max_hydrate=15 response="" parsed=""
+  local idx vid sev needs_hydrate aff_pkg aff_eco summary pkg mgr ver kind rcmd acmd found=0 is_mal=0
+  local m_eco m_mgr m_pkg m_ver vuln_json hydrated_line h_sev h_pkg h_eco h_sum
+  local cache_i cache_hit=0 hydrated_count=0
+  local -a cache_id_list=() cache_sev_list=() cache_pkg_list=() cache_eco_list=() cache_sum_list=()
 
   if [ "${UPDATE_ALL_SECURITY_SCAN:-1}" = 0 ]; then
     skip_step "safety coach: OSV package scan" "disabled via UPDATE_ALL_SECURITY_SCAN=0"
@@ -442,11 +638,25 @@ scan_osv_packages() {
     return 0
   fi
 
+  if ! command -v python3 >/dev/null 2>&1 && ! command -v jq >/dev/null 2>&1; then
+    skip_step "safety coach: OSV package scan" "OSV response parser requires python3 or jq"
+    return 0
+  fi
+
   if [ -n "${UPDATE_ALL_OSV_MOCK_FILE:-}" ] && [ -r "$UPDATE_ALL_OSV_MOCK_FILE" ]; then
     _ua_osv_eco=()
     _ua_osv_mgr=()
     _ua_osv_pkg=()
     _ua_osv_ver=()
+    if [ -n "${UPDATE_ALL_OSV_TUPLES_MOCK_FILE:-}" ] && [ -r "$UPDATE_ALL_OSV_TUPLES_MOCK_FILE" ]; then
+      while IFS='|' read -r m_eco m_mgr m_pkg m_ver; do
+        [ -n "$m_pkg" ] || continue
+        _ua_osv_eco+=("$m_eco")
+        _ua_osv_mgr+=("$m_mgr")
+        _ua_osv_pkg+=("$m_pkg")
+        _ua_osv_ver+=("$m_ver")
+      done < "$UPDATE_ALL_OSV_TUPLES_MOCK_FILE"
+    fi
     response="$(cat "$UPDATE_ALL_OSV_MOCK_FILE")"
   else
     _safety_collect_osv_tuples
@@ -472,9 +682,82 @@ scan_osv_packages() {
     fi
   fi
 
-  parsed="$(_safety_parse_osv_json "$response")"
-  while IFS='|' read -r idx vid sev aff_pkg aff_eco summary; do
+  parsed="$(_safety_parse_osv_batch "$response")"
+  while IFS='|' read -r idx vid sev needs_hydrate aff_pkg aff_eco summary; do
     [ -n "$vid" ] || continue
+    if ! _safety_valid_osv_id "$vid"; then
+      continue
+    fi
+
+    if [ "$needs_hydrate" = "1" ] && { [ -z "${UPDATE_ALL_OSV_MOCK_FILE:-}" ] || [ -n "${UPDATE_ALL_OSV_VULN_MOCK_DIR:-}" ]; }; then
+      cache_hit=0
+      h_sev=""
+      h_pkg=""
+      h_eco=""
+      h_sum=""
+      for ((cache_i = 0; cache_i < ${#cache_id_list[@]}; cache_i++)); do
+        if [ "${cache_id_list[$cache_i]}" = "$vid" ]; then
+          h_sev="${cache_sev_list[$cache_i]}"
+          h_pkg="${cache_pkg_list[$cache_i]}"
+          h_eco="${cache_eco_list[$cache_i]}"
+          h_sum="${cache_sum_list[$cache_i]}"
+          cache_hit=1
+          break
+        fi
+      done
+
+      if [ "$cache_hit" -eq 0 ] && [ "$hydrated_count" -lt "$max_hydrate" ]; then
+        hydrated_count=$((hydrated_count + 1))
+        vuln_json=""
+        if [ -n "${UPDATE_ALL_OSV_VULN_MOCK_DIR:-}" ] && [ -r "${UPDATE_ALL_OSV_VULN_MOCK_DIR}/${vid}.json" ]; then
+          vuln_json="$(cat "${UPDATE_ALL_OSV_VULN_MOCK_DIR}/${vid}.json")"
+        elif [ -z "${UPDATE_ALL_OSV_MOCK_FILE:-}" ] && command -v curl >/dev/null 2>&1; then
+          vuln_json="$(curl -fsS --max-time 4 "https://api.osv.dev/v1/vulns/${vid}" 2>/dev/null || true)"
+        fi
+        if [ -n "$vuln_json" ]; then
+          hydrated_line="$(_safety_parse_osv_vuln "$vuln_json")"
+          IFS='|' read -r h_sev h_pkg h_eco h_sum <<< "$hydrated_line"
+        fi
+        cache_id_list+=("$vid")
+        cache_sev_list+=("$h_sev")
+        cache_pkg_list+=("$h_pkg")
+        cache_eco_list+=("$h_eco")
+        cache_sum_list+=("$h_sum")
+      fi
+
+      [ -n "$sev" ] || sev="$h_sev"
+      [ -n "$aff_pkg" ] || aff_pkg="$h_pkg"
+      [ -n "$aff_eco" ] || aff_eco="$h_eco"
+      [ -n "$summary" ] || summary="$h_sum"
+    fi
+
+    is_mal=0
+    kind="ADVISORY"
+    case "$vid" in
+      MAL-*)
+        is_mal=1
+        kind="MALICIOUS"
+        sev="CRITICAL"
+        [ -n "$summary" ] || summary="OpenSSF Malicious Package match reported by OSV."
+        ;;
+      GHSA-*|CVE-*|PYSEC-*|RUSTSEC-*)
+        case "$sev" in
+          CRITICAL|HIGH) ;;
+          LOW|MODERATE|MEDIUM) continue ;;
+          "") sev="WARN" ;;
+          *) continue ;;
+        esac
+        [ -n "$summary" ] || summary="Security advisory reported by OSV."
+        ;;
+      *)
+        case "$sev" in
+          CRITICAL|HIGH) ;;
+          *) continue ;;
+        esac
+        [ -n "$summary" ] || summary="Security advisory reported by OSV."
+        ;;
+    esac
+
     found=$((found + 1))
     pkg=""
     mgr=""
@@ -487,17 +770,16 @@ scan_osv_packages() {
     [ -n "$pkg" ] || pkg="${aff_pkg:-unknown-package}"
     [ -n "$mgr" ] || mgr="${aff_eco:-npm}"
 
-    is_mal=0
-    kind="ADVISORY"
-    case "$vid" in
-      MAL-*) is_mal=1; kind="MALICIOUS"; sev="CRITICAL" ;;
-    esac
-
     _safety_osv_remedy_for "$mgr" "$pkg" "$is_mal" rcmd acmd
     if [ "$is_mal" = 1 ]; then
       add_security_finding "$kind" "$sev" "${pkg}${ver:+@${ver}} (${mgr})" "$vid" \
         "OpenSSF flagged this package as malicious: ${summary}" \
         "Uninstall this package immediately and rotate any credentials exposed in its environment." \
+        "$rcmd" "$acmd"
+    elif [ "$sev" = "WARN" ]; then
+      add_security_finding "$kind" "$sev" "${pkg}${ver:+@${ver}} (${mgr})" "$vid" \
+        "Security advisory (severity unrated in OSV): ${summary}" \
+        "Review this advisory and upgrade to a patched version or remove the package if unused." \
         "$rcmd" "$acmd"
     else
       add_security_finding "$kind" "$sev" "${pkg}${ver:+@${ver}} (${mgr})" "$vid" \
@@ -548,6 +830,10 @@ _safety_describe_bind_addr() {
       o1="${clean%%.*}"
       rest="${clean#*.}"
       o2="${rest%%.*}"
+      if [ -z "$o1" ] || [ -z "$o2" ]; then
+        printf 'non-loopback interface'
+        return 0
+      fi
       case "$o1:$o2" in
         *[!0-9:]*) printf 'non-loopback interface'; return 0 ;;
       esac
@@ -597,6 +883,7 @@ _safety_firewall_posture() {
 
 scan_public_ports() {
   local raw="" fw_note parsed="" seen="|" proto addr port proc bind_desc key found=0 proto_up
+  local use_firewalld=0 fw_remedy_desc="" fw_remedy_cmd=""
 
   if [ "${UPDATE_ALL_SECURITY_SCAN:-1}" = 0 ]; then
     skip_step "safety coach: open ports" "disabled via UPDATE_ALL_SECURITY_SCAN=0"
@@ -619,6 +906,9 @@ scan_public_ports() {
   fi
 
   fw_note="$(_safety_firewall_posture)"
+  if ! command -v ufw >/dev/null 2>&1 && command -v firewall-cmd >/dev/null 2>&1; then
+    use_firewalld=1
+  fi
 
   parsed="$(printf '%s\n' "$raw" | awk '
     /^[[:space:]]*(tcp|udp|tcp6|udp6)[[:space:]]/ {
@@ -664,14 +954,22 @@ scan_public_ports() {
     bind_desc="$(_safety_describe_bind_addr "$addr")"
     proto_up="$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')"
 
+    if [ "$use_firewalld" -eq 1 ]; then
+      fw_remedy_desc="Rebind '${proc}' to 127.0.0.1 in its config if only local access is needed, or close port ${port}/${proto} in firewalld and reload."
+      fw_remedy_cmd="sudo firewall-cmd --permanent --remove-port=${port}/${proto} && sudo firewall-cmd --reload"
+    else
+      fw_remedy_desc="Rebind '${proc}' to 127.0.0.1 in its config if only local access is needed, or deny inbound traffic via firewall."
+      fw_remedy_cmd="sudo ufw deny ${port}/${proto}"
+    fi
+
     add_security_finding \
       "EXPOSED PORT" \
       "WARN" \
       "${proc} (${proto}/${port} on ${bind_desc})" \
       "PORT-${proto_up}-${port}" \
       "Process '${proc}' is listening on ${bind_desc} port ${port}/${proto} instead of localhost-only. Firewall check: ${fw_note}." \
-      "Rebind '${proc}' to 127.0.0.1 in its config if only local access is needed, or deny inbound traffic via firewall." \
-      "sudo ufw deny ${port}/${proto}" \
+      "$fw_remedy_desc" \
+      "$fw_remedy_cmd" \
       "ss -tulnpH sport = :${port}"
   done <<< "$parsed"
 
@@ -719,7 +1017,7 @@ run_safety_coach_scan() {
   fi
 }
 
-_safety_exec_remedy_cmd() {
+_safety_exec_single_remedy_cmd() {
   local cmd="$1" tok
   local -a parts=()
   [ -n "$cmd" ] || return 1
@@ -742,6 +1040,21 @@ _safety_exec_remedy_cmd() {
   fi
 }
 
+_safety_exec_remedy_cmd() {
+  local cmd="$1" left right
+  [ -n "$cmd" ] || return 1
+  case "$cmd" in
+    *" && "*)
+      left="${cmd%% && *}"
+      right="${cmd#* && }"
+      _safety_exec_single_remedy_cmd "$left" && _safety_exec_single_remedy_cmd "$right"
+      ;;
+    *)
+      _safety_exec_single_remedy_cmd "$cmd"
+      ;;
+  esac
+}
+
 run_safety_coach_remedy() {
   local total="${#_ua_sec_kind[@]}" i sev kind target vid summary rdesc rcmd acmd
   local badge_color interactive=0 choice
@@ -757,12 +1070,21 @@ run_safety_coach_remedy() {
   fi
 
   printf '\n'
-  printf '  %b╭──────────────────────────────────────────────────────────────────────────────╮%b\n' "${C_ORANGE:-}" "${C_RESET:-}"
-  printf '  %b│%b %b%s SAFETY COACH — ISSUES FOUND (%d)%b\n' \
-    "${C_ORANGE:-}" "${C_RESET:-}" "${C_BAD:-${C_ORANGE:-}}" "$G_SAFETY" "$total" "${C_RESET:-}"
-  printf '  %b│%b %bGuided review: nothing is deleted or blocked automatically, even with --all.%b\n' \
-    "${C_ORANGE:-}" "${C_RESET:-}" "${C_PURPOSE:-}" "${C_RESET:-}"
-  printf '  %b╰──────────────────────────────────────────────────────────────────────────────╯%b\n\n' "${C_ORANGE:-}" "${C_RESET:-}"
+  if [ "${_ua_utf8:-1}" -eq 0 ]; then
+    printf '  %b+------------------------------------------------------------------------------+%b\n' "${C_ORANGE:-}" "${C_RESET:-}"
+    printf '  %b|%b %b%s SAFETY COACH -- ISSUES FOUND (%d)%b\n' \
+      "${C_ORANGE:-}" "${C_RESET:-}" "${C_BAD:-${C_ORANGE:-}}" "$G_SAFETY" "$total" "${C_RESET:-}"
+    printf '  %b|%b %bGuided review: nothing is deleted or blocked automatically, even with --all.%b\n' \
+      "${C_ORANGE:-}" "${C_RESET:-}" "${C_PURPOSE:-}" "${C_RESET:-}"
+    printf '  %b+------------------------------------------------------------------------------+%b\n\n' "${C_ORANGE:-}" "${C_RESET:-}"
+  else
+    printf '  %b╭──────────────────────────────────────────────────────────────────────────────╮%b\n' "${C_ORANGE:-}" "${C_RESET:-}"
+    printf '  %b│%b %b%s SAFETY COACH — ISSUES FOUND (%d)%b\n' \
+      "${C_ORANGE:-}" "${C_RESET:-}" "${C_BAD:-${C_ORANGE:-}}" "$G_SAFETY" "$total" "${C_RESET:-}"
+    printf '  %b│%b %bGuided review: nothing is deleted or blocked automatically, even with --all.%b\n' \
+      "${C_ORANGE:-}" "${C_RESET:-}" "${C_PURPOSE:-}" "${C_RESET:-}"
+    printf '  %b╰──────────────────────────────────────────────────────────────────────────────╯%b\n\n' "${C_ORANGE:-}" "${C_RESET:-}"
+  fi
 
   for ((i = 0; i < total; i++)); do
     sev="${_ua_sec_sev[$i]}"

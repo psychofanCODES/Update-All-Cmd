@@ -493,7 +493,7 @@ github_pat="github_pat_$(printf 'c%.0s' {1..24})"
 slack_token="xoxb-$(printf 'd%.0s' {1..24})"
 aws_prefix="AK"
 aws_token="${aws_prefix}IA$(printf '9%.0s' {1..16})"
-pem_hdr="-----BEG""IN RSA PRI""VATE KEY-----"
+pem_hdr="-----BEGIN RSA ""PRIVATE"" KEY-----"
 generic_val="fakeSecretValue987654"
 
 redacted_all="$(
@@ -573,6 +573,43 @@ if [ -r "$sudo_log" ] && grep -F -- "-v" "$sudo_log" >/dev/null; then
 else
   pass
 fi
+
+# --- Suite 6b (C4): Cached sudo -n true with UPDATE_ALL_SUDO_SECRET_KEY skips secret get & keeps stdin closed ---
+cached_sudo_bin="$tmpdir/cached-sudo-bin"
+secret_get_sentinel="$tmpdir/secret-get-ran.sentinel"
+make_mock "$cached_sudo_bin" secret <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  has) [ "${2:-}" = "test-sudo-key" ] ;;
+  get)
+    touch "${UPDATE_ALL_SECRET_GET_SENTINEL:-/tmp/secret-get-unset}"
+    printf 'fake-password\n'
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+make_mock "$cached_sudo_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-n" ]; then
+  shift
+  [ "${1:-}" = "true" ] && exit 0
+  "$@"
+  exit $?
+fi
+"$@"
+EOF
+
+cached_sudo_out="$(
+  printf '%s\n' keyboard keyboard keyboard keyboard keyboard keyboard \
+    | PATH="$cached_sudo_bin:$posix_bin" \
+      UPDATE_ALL_SUDO_SECRET_KEY=test-sudo-key \
+      UPDATE_ALL_SECRET_GET_SENTINEL="$secret_get_sentinel" \
+      UPDATE_ALL_STDIN_SELFTEST=1 UPDATE_ALL_STDIN_INCLUDE_SUDO=1 \
+      "$UPDATE_ALL" --no-anim --no-color
+)"
+assert_contains "$cached_sudo_out" "sudo-cmd-closed" "cached sudo -n true must keep child stdin closed"
+assert_not_contains "$cached_sudo_out" "sudo-cmd-open" "cached sudo -n true must not expose stdin to child"
+assert_file_not_exists "$secret_get_sentinel" "cached sudo -n true must NOT invoke secret get"
 
 # --- Suite 7: Firmware --all vs --firmware, classifiers, firmware summary, interactive PTY 'a' ---
 prompt_bin="$tmpdir/prompt-bin"
@@ -749,6 +786,19 @@ else
   pass
 fi
 
+# --- Suite 8b (C1): Live PTY dock (--bar=bottom) and inline watcher (--bar=off) ---
+pty_bar_out="$(
+  run_in_pty "" "HOME='$fake_home' PATH='$posix_bin' TERM=xterm-256color UPDATE_ALL_WATCHER_SELFTEST=pty-bar '$UPDATE_ALL' --bar=bottom"
+)"
+assert_contains "$pty_bar_out" "tick-start" "pty-bar (--bar=bottom) must stream tick-start"
+assert_contains "$pty_bar_out" "tick-end" "pty-bar (--bar=bottom) must stream tick-end cleanly"
+
+pty_bar_off_out="$(
+  run_in_pty "" "HOME='$fake_home' PATH='$posix_bin' TERM=xterm-256color UPDATE_ALL_WATCHER_SELFTEST=pty-bar '$UPDATE_ALL' --bar=off"
+)"
+assert_contains "$pty_bar_off_out" "tick-start" "pty-bar (--bar=off) inline watcher must stream tick-start"
+assert_contains "$pty_bar_off_out" "tick-end" "pty-bar (--bar=off) inline watcher must stream tick-end cleanly"
+
 # --- Suite 11: Safety Coach (OSV malicious package + exposed ports) ---
 safety_bin="$tmpdir/safety-bin"
 npm_uninstall_sentinel="$tmpdir/npm-uninstall-ran.sentinel"
@@ -812,6 +862,113 @@ assert_contains "$ports_out" "node (tcp/3000 on all interfaces (0.0.0.0))" "port
 assert_contains "$ports_out" "sudo ufw deny 3000/tcp" "ports selftest must provide ufw deny guidance"
 assert_not_contains "$ports_out" "5432" "ports selftest must exclude loopback 127.0.0.1:5432"
 assert_not_contains "$ports_out" "postgres" "ports selftest must exclude loopback process postgres"
+
+# --- Suite 11b (C3): Compact OSV querybatch index alignment, PYSEC/RUSTSEC hydration, parser guard ---
+osv_tuples_mock="$tmpdir/osv-tuples.txt"
+cat > "$osv_tuples_mock" <<'EOF'
+npm|npm|clean-alpha|1.0.0
+PyPI|uv|clean-beta|2.0.0
+npm|npm|bad-gamma|0.9.1
+EOF
+
+osv_compact_mock="$tmpdir/osv-compact.json"
+printf '%s\n' '{"results":[{},{},{"vulns":[{"id":"MAL-2026-9999","modified":"2026-07-01T00:00:00Z"}]}]}' > "$osv_compact_mock"
+
+osv_compact_out="$(
+  HOME="$fake_home" PATH="$posix_bin" \
+  UPDATE_ALL_SAFETY_SELFTEST=osv \
+  UPDATE_ALL_OSV_MOCK_FILE="$osv_compact_mock" \
+  UPDATE_ALL_OSV_TUPLES_MOCK_FILE="$osv_tuples_mock" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
+)"
+assert_contains "$osv_compact_out" "CRITICAL · MALICIOUS" "compact querybatch must flag MAL-* as CRITICAL · MALICIOUS"
+assert_contains "$osv_compact_out" "bad-gamma@0.9.1 (npm)" "compact querybatch must attribute finding to index-2 package"
+assert_contains "$osv_compact_out" "MAL-2026-9999" "compact querybatch must preserve MAL-2026-9999 ID"
+assert_contains "$osv_compact_out" "npm uninstall -g bad-gamma" "compact querybatch must generate uninstall command for index-2 package"
+assert_not_contains "$osv_compact_out" "clean-alpha" "compact querybatch must NOT misattribute index-2 finding to index-0 package"
+assert_not_contains "$osv_compact_out" "clean-beta" "compact querybatch must NOT misattribute index-2 finding to index-1 package"
+
+osv_adv_tuples="$tmpdir/osv-adv-tuples.txt"
+cat > "$osv_adv_tuples" <<'EOF'
+PyPI|uv|py-high-pkg|1.2.0
+crates.io|cargo|rust-unrated-pkg|0.3.0
+PyPI|pipx|py-low-pkg|4.0.0
+EOF
+
+osv_adv_batch="$tmpdir/osv-adv-batch.json"
+printf '%s\n' '{"results":[{"vulns":[{"id":"PYSEC-2026-1001","modified":"2026-07-01T00:00:00Z"}]},{"vulns":[{"id":"RUSTSEC-2026-2002","modified":"2026-07-01T00:00:00Z"}]},{"vulns":[{"id":"PYSEC-2026-1003","modified":"2026-07-01T00:00:00Z"}]}]}' > "$osv_adv_batch"
+
+osv_vuln_dir="$tmpdir/osv-vulns"
+mkdir -p -- "$osv_vuln_dir"
+printf '%s\n' '{"id":"PYSEC-2026-1001","summary":"Arbitrary code execution in py-high-pkg","database_specific":{"severity":"HIGH"}}' > "$osv_vuln_dir/PYSEC-2026-1001.json"
+printf '%s\n' '{"id":"RUSTSEC-2026-2002","summary":"Memory safety issue in rust-unrated-pkg"}' > "$osv_vuln_dir/RUSTSEC-2026-2002.json"
+printf '%s\n' '{"id":"PYSEC-2026-1003","summary":"Minor low-impact issue","database_specific":{"severity":"LOW"}}' > "$osv_vuln_dir/PYSEC-2026-1003.json"
+
+osv_adv_out="$(
+  HOME="$fake_home" PATH="$posix_bin" \
+  UPDATE_ALL_SAFETY_SELFTEST=osv \
+  UPDATE_ALL_OSV_MOCK_FILE="$osv_adv_batch" \
+  UPDATE_ALL_OSV_TUPLES_MOCK_FILE="$osv_adv_tuples" \
+  UPDATE_ALL_OSV_VULN_MOCK_DIR="$osv_vuln_dir" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
+)"
+assert_contains "$osv_adv_out" "HIGH · ADVISORY" "hydrated PYSEC HIGH advisory must render HIGH · ADVISORY"
+assert_contains "$osv_adv_out" "PYSEC-2026-1001" "hydrated PYSEC advisory must include ID"
+assert_contains "$osv_adv_out" "Arbitrary code execution in py-high-pkg" "hydrated PYSEC advisory must show hydrated summary"
+assert_contains "$osv_adv_out" "WARN · ADVISORY" "unrated RUSTSEC advisory must render WARN · ADVISORY (not dropped or promoted to HIGH)"
+assert_contains "$osv_adv_out" "RUSTSEC-2026-2002" "unrated RUSTSEC advisory must include ID"
+assert_not_contains "$osv_adv_out" "PYSEC-2026-1003" "LOW-severity PYSEC advisory must be filtered out"
+assert_not_contains "$osv_adv_out" "py-low-pkg" "LOW-severity package must not appear in findings"
+
+# Missing both python3 and jq must emit clean SKIP instead of broken awk fallback
+no_parser_bin="$tmpdir/no-parser-bin"
+mkdir -p -- "$no_parser_bin"
+for _u in bash sh env awk sed grep tr cut cat head tail wc sort uniq fold mktemp mkdir rm mv cp chmod date uname id readlink dirname basename sleep kill true false printf test '[' ls stat touch which; do
+  if [ -e "$posix_bin/$_u" ]; then
+    ln -sf "$posix_bin/$_u" "$no_parser_bin/$_u"
+  fi
+done
+no_parser_out="$(
+  HOME="$fake_home" PATH="$no_parser_bin" \
+  UPDATE_ALL_SAFETY_SELFTEST=osv \
+  UPDATE_ALL_OSV_MOCK_FILE="$osv_compact_mock" \
+  UPDATE_ALL_OSV_TUPLES_MOCK_FILE="$osv_tuples_mock" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
+)"
+assert_contains "$no_parser_out" "OSV response parser requires python3 or jq" "missing python3 and jq must emit clean SKIP note"
+
+# --- Suite 11c (M7): Leading-dash package token rejection & firewalld remedy ---
+evil_tuples_mock="$tmpdir/evil-tuples.txt"
+printf '%s\n' 'npm|npm|--evil|1.0.0' > "$evil_tuples_mock"
+evil_osv_mock="$tmpdir/evil-osv.json"
+printf '%s\n' '{"results":[{"vulns":[{"id":"MAL-2026-8888","summary":"Option-injection package name test"}]}]}' > "$evil_osv_mock"
+
+evil_osv_out="$(
+  HOME="$fake_home" PATH="$posix_bin" \
+  UPDATE_ALL_SAFETY_SELFTEST=osv \
+  UPDATE_ALL_OSV_MOCK_FILE="$evil_osv_mock" \
+  UPDATE_ALL_OSV_TUPLES_MOCK_FILE="$evil_tuples_mock" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
+)"
+assert_contains "$evil_osv_out" "MAL-2026-8888" "leading-dash package must still be reported as a finding"
+assert_not_contains "$evil_osv_out" "npm uninstall -g --evil" "leading-dash package name must NEVER generate a remedy command"
+
+fw_bin="$tmpdir/fw-bin"
+make_mock "$fw_bin" firewall-cmd <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --state) printf 'running\n' ;;
+  *) exit 0 ;;
+esac
+EOF
+fw_ports_out="$(
+  HOME="$fake_home" PATH="$fw_bin:$posix_bin" \
+  UPDATE_ALL_SAFETY_SELFTEST=ports \
+  UPDATE_ALL_PORTS_MOCK_FILE="$ports_mock" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
+)"
+assert_contains "$fw_ports_out" "sudo firewall-cmd --permanent --remove-port=3000/tcp && sudo firewall-cmd --reload" "firewalld host without ufw must show firewall-cmd remedy"
+assert_contains "$fw_ports_out" "firewalld (running)" "firewalld host must report firewalld posture"
 
 # ===========================================================================
 # Wait for all parallel dry-run / live-mock / dist jobs, then assert results
@@ -1028,6 +1185,25 @@ if [ -x "$DIST_BUNDLE" ]; then
   assert_contains "$dist_help" "--dry-run" "dist/update-all --help must list --dry-run"
   assert_contains "$dist_help" "--firmware" "dist/update-all --help must list --firmware"
   assert_contains "$dist_help" "--watcher=MODE" "dist/update-all --help must list --watcher=MODE"
+  assert_contains "$dist_help" "UPDATE_ALL_PROBE_TIMEOUT=15s" "dist/update-all --help must document UPDATE_ALL_PROBE_TIMEOUT=15s"
+  assert_contains "$dist_help" "UPDATE_ALL_BUILD_TIMEOUT=1200s" "dist/update-all --help must document UPDATE_ALL_BUILD_TIMEOUT=1200s"
+
+  # M1: Verify set -uo pipefail and defaults precede inlined modules, and bundle matches builder output
+  if awk '
+    /^set -uo pipefail$/ && !pipefail_ln { pipefail_ln = NR }
+    /UPDATE_ALL_PROBE_TIMEOUT=.*15s/ && !probe_ln { probe_ln = NR }
+    /UPDATE_ALL_BUILD_TIMEOUT=.*1200s/ && !build_ln { build_ln = NR }
+    /^# ===== MODULE: lib\/colors_and_glyphs\.sh =====$/ && !mod_ln { mod_ln = NR }
+    END { if (!pipefail_ln || !probe_ln || !build_ln || !mod_ln || !(pipefail_ln < probe_ln && probe_ln < build_ln && build_ln < mod_ln)) exit 1 }
+  ' "$DIST_BUNDLE"; then pass
+  else fail "dist/update-all must set pipefail and timeout defaults before inlined modules"; fi
+
+  dist_check="$tmpdir/dist-check"
+  if "$ROOT_DIR/scripts/build-standalone.sh" "$dist_check" >/dev/null 2>&1 && cmp -s "$DIST_BUNDLE" "$dist_check"; then
+    pass
+  else
+    fail "dist/update-all does not match scripts/build-standalone.sh output (rebuild needed)"
+  fi
 
   dist_visual="$(read_out dist-visual)"
   assert_eq "$(read_rc dist-visual)" "0" "dist/update-all visual receipt selftest must exit 0"
@@ -1036,6 +1212,12 @@ if [ -x "$DIST_BUNDLE" ]; then
 else
   fail "standalone bundle dist/update-all is missing or not executable (run scripts/build-standalone.sh)"
 fi
+
+# Minor 2: LC_ALL=C ASCII receipt alignment check (1-char '>' center arrow & ASCII borders)
+ascii_receipt="$(HOME="$fake_home" PATH="$posix_bin" LC_ALL=C UPDATE_ALL_RECEIPT_SELFTEST=visual "$UPDATE_ALL" --no-anim --no-color)"
+assert_contains "$ascii_receipt" "+---+" "LC_ALL=C receipt table must use ASCII +---+ center column border"
+assert_contains "$ascii_receipt" "| > |" "LC_ALL=C receipt table must use 1-char '>' center arrow"
+assert_not_contains "$ascii_receipt" "┌" "LC_ALL=C receipt table must not emit UTF-8 box characters"
 
 END_S="$(date +%s)"
 ELAPSED=$((END_S - START_S))

@@ -226,7 +226,7 @@ bash tests/test-output-format.sh
 ./scripts/build-standalone.sh
 ./bin/update-all --help
 ./bin/update-all --dry-run --no-anim --no-color
-cspell README.md bin/update-all install.sh docs/UPDATE_ALL_HANDOFF.md cspell.json tests/test-output-format.sh CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md .github/*.md .github/*.yml .github/**/*.md .github/**/*.yml
+cspell README.md bin/update-all install.sh scripts/build-standalone.sh lib/*.sh docs/UPDATE_ALL_HANDOFF.md cspell.json tests/test-output-format.sh CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md .github/*.md .github/*.yml .github/**/*.md .github/**/*.yml
 git diff --check
 ```
 

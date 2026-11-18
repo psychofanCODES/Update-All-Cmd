@@ -1,9 +1,10 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
 # Universal Linux/macOS host discovery, bounded version probes,
 # coverage preflight, and upfront optional choice collection.
 # Bash 3.2 parse-compatible; sourced by bin/update-all.
 
-UPDATE_ALL_PROBE_TIMEOUT="${UPDATE_ALL_PROBE_TIMEOUT:-8s}"
+UPDATE_ALL_PROBE_TIMEOUT="${UPDATE_ALL_PROBE_TIMEOUT:-15s}"
 UPDATE_ALL_DRY_RUN_PROBES="${UPDATE_ALL_DRY_RUN_PROBES:-0}"
 UPDATE_ALL_FIRMWARE_FLAG="${UPDATE_ALL_FIRMWARE_FLAG:-0}"
 UPDATE_ALL_NONINTERACTIVE="${UPDATE_ALL_NONINTERACTIVE:-${UPDATE_ALL_NON_INTERACTIVE:-0}}"
@@ -25,7 +26,7 @@ if ! declare -p _ua_planned_keys >/dev/null 2>&1; then
 fi
 
 _ua_probe_bounded() {
-  local limit="${UPDATE_ALL_PROBE_TIMEOUT:-8s}"
+  local limit="${UPDATE_ALL_PROBE_TIMEOUT:-15s}"
   if declare -F run_probe_bounded >/dev/null 2>&1; then
     run_probe_bounded "$limit" \
       env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
@@ -150,7 +151,11 @@ tool_install_owner() {
   case "$real_path" in
     /snap/*) printf 'snap'; return 0 ;;
     /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*)
-      is_path_writable "$real_path" && printf 'user' || printf 'distro'
+      if is_path_writable "$real_path"; then
+        printf 'user'
+      else
+        printf 'distro'
+      fi
       return 0 ;;
   esac
 
@@ -233,6 +238,7 @@ discover_environment() {
   [ "$_ua_has_update_node" = 1 ] && _ua_planned_keys+=("node")
   [ "$_ua_has_mise" = 1 ] && _ua_planned_keys+=("mise")
   [ "$_ua_has_volta" = 1 ] && _ua_planned_keys+=("volta")
+  [ "$_ua_has_fnm" = 1 ] && _ua_planned_keys+=("fnm")
   [ "$_ua_has_corepack" = 1 ] && _ua_planned_keys+=("corepack")
   [ "$_ua_has_pnpm" = 1 ] && _ua_planned_keys+=("pnpm")
   [ "$_ua_has_yarn" = 1 ] && _ua_planned_keys+=("yarn")
@@ -245,12 +251,12 @@ discover_environment() {
   [ "$_ua_has_uv" = 1 ] && _ua_planned_keys+=("uv" "uv-tools")
   [ "$_ua_has_pipx" = 1 ] && _ua_planned_keys+=("pipx")
   [ "$_ua_has_rustup" = 1 ] && _ua_planned_keys+=("rustup")
-  [ "$_ua_has_cargo_install_update" = 1 ] && _ua_planned_keys+=("cargo-installed")
+  [ "$_ua_has_cargo" = 1 ] && [ "$_ua_has_cargo_install_update" = 1 ] && _ua_planned_keys+=("cargo-installed")
   [ "$_ua_has_gh" = 1 ] && _ua_planned_keys+=("gh")
   [ "$_ua_has_code" = 1 ] && _ua_planned_keys+=("code")
   [ "$_ua_has_codium" = 1 ] && _ua_planned_keys+=("codium")
   [ "$_ua_has_code_insiders" = 1 ] && _ua_planned_keys+=("code-insiders")
-  _ua_planned_keys+=("apt-cleanup" "workstation-cleanup" "safety")
+  _ua_planned_keys+=("apt-cleanup" "workstation-cleanup" "safety-osv" "safety-ports")
 
   _ua_step_total="${#_ua_planned_keys[@]}"
   if declare -F timings_set_planned_keys >/dev/null 2>&1; then
@@ -417,6 +423,7 @@ show_update_coverage_preflight() {
   coverage_item "Node runtime" "update-node" "user-local Node runtime when update-node exists"
   [ "$_ua_has_mise" = 1 ] && coverage_item "mise runtimes" "mise" "mise upgrade"
   [ "$_ua_has_volta" = 1 ] && coverage_item "Volta shims" "volta" "pinned Node toolchain status"
+  [ "$_ua_has_fnm" = 1 ] && coverage_item "fnm Node manager" "fnm" "installed Node versions status (no surprise switch)"
   coverage_item "Corepack / pnpm / yarn" "corepack" "package-manager shims and activated managers"
   coverage_item "npm globals" "npm" "npm itself and globally installed npm CLIs"
   coverage_item "Claude Code CLI" "claude" "claude update"

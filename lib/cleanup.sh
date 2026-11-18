@@ -1,19 +1,10 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
 # Distro-aware package manager cleanup and safe, bounded workstation cache cleanup.
 # Public-safe: no hardcoded user home paths, private IPs, or secrets.
 
 : "${_ua_reclaimed_kb:=0}"
 : "${_ua_has_systemd:=0}"
-: "${G_UPDATED:=↗}"
-: "${G_OK:=✓}"
-: "${G_UNCHANGED:==}"
-: "${G_FAIL:=✗}"
-: "${G_SKIP:=·}"
-: "${G_WARN:=▲}"
-: "${G_SAFETY:=◆}"
-: "${G_ARROW:=→}"
-: "${G_GUTTER:=│}"
-: "${G_CARD:=▌}"
 
 _cleanup_detect_pkg_mgr() {
   local raw=""
@@ -26,7 +17,8 @@ _cleanup_detect_pkg_mgr() {
     case "$raw" in
       apt|apt-get) printf 'apt' ;;
       dnf|dnf5|yum) printf 'dnf' ;;
-      pacman|apk) printf '%s' "$raw" ;;
+      pacman|zypper|apk) printf '%s' "$raw" ;;
+      xbps|xbps-install|xbps-remove) printf 'xbps' ;;
       *) printf '%s' "$raw" ;;
     esac
     return 0
@@ -37,10 +29,32 @@ _cleanup_detect_pkg_mgr() {
     printf 'dnf'
   elif command -v pacman >/dev/null 2>&1; then
     printf 'pacman'
+  elif command -v zypper >/dev/null 2>&1; then
+    printf 'zypper'
   elif command -v apk >/dev/null 2>&1; then
     printf 'apk'
+  elif command -v xbps-install >/dev/null 2>&1 || command -v xbps-remove >/dev/null 2>&1; then
+    printf 'xbps'
   else
     printf 'none'
+  fi
+}
+
+_cleanup_detect_dnf_bin() {
+  case "${_ua_sys_pkg_mgr:-}" in
+    dnf5|dnf|yum)
+      printf '%s' "$_ua_sys_pkg_mgr"
+      return 0
+      ;;
+  esac
+  if command -v dnf5 >/dev/null 2>&1; then
+    printf 'dnf5'
+  elif command -v dnf >/dev/null 2>&1; then
+    printf 'dnf'
+  elif command -v yum >/dev/null 2>&1; then
+    printf 'yum'
+  else
+    printf 'dnf'
   fi
 }
 
@@ -130,15 +144,25 @@ cleanup_question() {
       printf '%s%bThis will clear uninstalled package tarballs from the pacman cache (pacman -Sc).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
       printf '%s%bInstalled packages and user files are left alone.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
       ;;
+    zypper)
+      _cleanup_print_banner_art "ZYPPER CLEANUP?" "ZYPPER" "CLEANUP"
+      printf '%s%bThis will clear downloaded zypper repository caches (zypper --non-interactive clean --all).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
+      printf '%s%bInstalled packages and user files are left alone.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
+      ;;
     apk)
       _cleanup_print_banner_art "APK CACHE CLEANUP?" "APK" "CACHE CLEANUP"
       printf '%s%bThis will clear cached Alpine package archives (apk cache clean).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
       printf '%s%bInstalled packages and user files are left alone.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
       ;;
+    xbps)
+      _cleanup_print_banner_art "XBPS CLEANUP?" "XBPS" "CLEANUP"
+      printf '%s%bThis will remove orphaned Void packages and obsolete cached archives (xbps-remove -Oo).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
+      printf '%s%bNothing outside xbps is deleted here.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
+      ;;
     *)
       printf '\n'
       printf '%s%bSYSTEM PACKAGE CLEANUP%b\n' "$indent" "${C_CLEANUP_WORD:-}" "${C_RESET:-}"
-      printf '%s%bNo supported Linux system package manager (apt/dnf/pacman/apk) detected on this host.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
+      printf '%s%bNo supported Linux system package manager (apt/dnf/pacman/zypper/apk/xbps) detected on this host.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
       return 0
       ;;
   esac
@@ -202,7 +226,7 @@ workstation_cleanup_question() {
     "$HOME/.codex/.tmp/plugins")"
 
   printf '\n'
-  printf '   %b%s WORKSTATION CACHE CLEANUP?%b\n' "${C_CLEANUP_WORD:-${C_UNIT:-}}" "$G_CARD" "${C_RESET:-}"
+  printf '   %b%s WORKSTATION CACHE CLEANUP?%b\n' "${C_CLEANUP_WORD:-${C_UNIT:-}}" "${G_CARD:-▌}" "${C_RESET:-}"
   printf '   %bThis removes rebuildable caches and old update leftovers only.%b\n' "${C_PURPOSE:-}" "${C_RESET:-}"
   printf '   %bIt leaves archives, LLM weights, project data, active virtualenvs, and databases alone.%b\n' "${C_TIP:-}" "${C_RESET:-}"
   printf '   %bDetected on this host:%b %s\n' "${C_LABEL:-}" "${C_RESET:-}" "$targets_summary"
@@ -230,7 +254,7 @@ _cleanup_run_apt() {
 }
 
 run_system_pkg_cleanup() {
-  local pkg_mgr code_a=0 code_b=0 code_c=0 before_kb=0 after_kb=0 reclaimed=0
+  local pkg_mgr dnf_bin="" code_a=0 code_b=0 code_c=0 before_kb=0 after_kb=0 reclaimed=0
   pkg_mgr="$(_cleanup_detect_pkg_mgr)"
 
   case "$pkg_mgr" in
@@ -256,18 +280,20 @@ run_system_pkg_cleanup() {
       return $?
       ;;
     dnf)
+      dnf_bin="$(_cleanup_detect_dnf_bin)"
       if [ "${UPDATE_ALL_DRY_RUN:-0}" = 1 ]; then
-        show_cmd sudo dnf autoremove -y
-        show_cmd sudo dnf clean packages
+        show_cmd sudo "$dnf_bin" autoremove -y
+        show_cmd sudo "$dnf_bin" clean packages
         return 0
       fi
-      before_kb="$(dir_size_kb /var/cache/dnf)"
-      sudo_cmd dnf autoremove -y || code_a=$?
-      sudo_cmd dnf clean packages || code_b=$?
-      after_kb="$(dir_size_kb /var/cache/dnf)"
+      before_kb="$(dir_size_kb /var/cache/dnf /var/cache/libdnf5 /var/cache/yum)"
+      sudo_cmd "$dnf_bin" autoremove -y || code_a=$?
+      sudo_cmd "$dnf_bin" clean packages || code_b=$?
+      after_kb="$(dir_size_kb /var/cache/dnf /var/cache/libdnf5 /var/cache/yum)"
       if [ "$before_kb" -gt "$after_kb" ]; then
         reclaimed=$((before_kb - after_kb))
         _ua_reclaimed_kb=$(( ${_ua_reclaimed_kb:-0} + reclaimed ))
+        printf '   %b%-15s%b %b%s%b\n' "${C_LABEL:-}" "reclaimed" "${C_RESET:-}" "${C_OK:-}" "$(format_kb_human "$reclaimed")" "${C_RESET:-}"
       fi
       [ "$code_a" -eq 0 ] && [ "$code_b" -eq 0 ]
       return $?
@@ -283,6 +309,22 @@ run_system_pkg_cleanup() {
       if [ "$before_kb" -gt "$after_kb" ]; then
         reclaimed=$((before_kb - after_kb))
         _ua_reclaimed_kb=$(( ${_ua_reclaimed_kb:-0} + reclaimed ))
+        printf '   %b%-15s%b %b%s%b\n' "${C_LABEL:-}" "reclaimed" "${C_RESET:-}" "${C_OK:-}" "$(format_kb_human "$reclaimed")" "${C_RESET:-}"
+      fi
+      return "$code_a"
+      ;;
+    zypper)
+      if [ "${UPDATE_ALL_DRY_RUN:-0}" = 1 ]; then
+        show_cmd sudo zypper --non-interactive clean --all
+        return 0
+      fi
+      before_kb="$(dir_size_kb /var/cache/zypp)"
+      sudo_cmd zypper --non-interactive clean --all || code_a=$?
+      after_kb="$(dir_size_kb /var/cache/zypp)"
+      if [ "$before_kb" -gt "$after_kb" ]; then
+        reclaimed=$((before_kb - after_kb))
+        _ua_reclaimed_kb=$(( ${_ua_reclaimed_kb:-0} + reclaimed ))
+        printf '   %b%-15s%b %b%s%b\n' "${C_LABEL:-}" "reclaimed" "${C_RESET:-}" "${C_OK:-}" "$(format_kb_human "$reclaimed")" "${C_RESET:-}"
       fi
       return "$code_a"
       ;;
@@ -294,8 +336,23 @@ run_system_pkg_cleanup() {
       sudo_cmd apk cache clean
       return $?
       ;;
+    xbps)
+      if [ "${UPDATE_ALL_DRY_RUN:-0}" = 1 ]; then
+        show_cmd sudo xbps-remove -Oo
+        return 0
+      fi
+      before_kb="$(dir_size_kb /var/cache/xbps)"
+      sudo_cmd xbps-remove -Oo || code_a=$?
+      after_kb="$(dir_size_kb /var/cache/xbps)"
+      if [ "$before_kb" -gt "$after_kb" ]; then
+        reclaimed=$((before_kb - after_kb))
+        _ua_reclaimed_kb=$(( ${_ua_reclaimed_kb:-0} + reclaimed ))
+        printf '   %b%-15s%b %b%s%b\n' "${C_LABEL:-}" "reclaimed" "${C_RESET:-}" "${C_OK:-}" "$(format_kb_human "$reclaimed")" "${C_RESET:-}"
+      fi
+      return "$code_a"
+      ;;
     *)
-      return 0
+      return 1
       ;;
   esac
 }
@@ -333,7 +390,17 @@ run_workstation_cleanup() {
   )
   if command -v brew >/dev/null 2>&1; then
     brew_cache="$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew --cache 2>/dev/null || true)"
-    [ -n "$brew_cache" ] && tracked_paths+=("$brew_cache")
+    brew_cache="${brew_cache%/}"
+    if [ -n "$brew_cache" ]; then
+      local seen_brew_cache=0 tp=""
+      for tp in "${tracked_paths[@]}"; do
+        if [ "${tp%/}" = "$brew_cache" ]; then
+          seen_brew_cache=1
+          break
+        fi
+      done
+      [ "$seen_brew_cache" -eq 0 ] && tracked_paths+=("$brew_cache")
+    fi
   fi
 
   before_kb="$(dir_size_kb "${tracked_paths[@]}")"
@@ -411,7 +478,7 @@ done
 }
 
 run_cleanup_phase() {
-  local pkg_mgr step_label step_title step_status="SKIP" ws_status="SKIP" clean_rc=0 ws_rc=0 ws_note
+  local pkg_mgr dnf_bin="" step_label step_title step_status="SKIP" ws_status="SKIP" clean_rc=0 ws_rc=0 ws_note supported_pkg_mgr=1
   pkg_mgr="$(_cleanup_detect_pkg_mgr)"
 
   if declare -F tui_set_phase >/dev/null 2>&1; then
@@ -421,10 +488,15 @@ run_cleanup_phase() {
 
   case "$pkg_mgr" in
     apt)    step_label="apt autoremove"; step_title="apt cleanup" ;;
-    dnf)    step_label="dnf autoremove"; step_title="dnf cleanup" ;;
+    dnf)
+      dnf_bin="$(_cleanup_detect_dnf_bin)"
+      step_label="${dnf_bin} autoremove"; step_title="${dnf_bin} cleanup"
+      ;;
     pacman) step_label="pacman cache clean"; step_title="pacman cache cleanup" ;;
+    zypper) step_label="zypper cleanup"; step_title="zypper cleanup" ;;
     apk)    step_label="apk cache clean"; step_title="apk cache cleanup" ;;
-    *)      step_label="apt autoremove"; step_title="system package cleanup" ;;
+    xbps)   step_label="xbps cleanup"; step_title="xbps cleanup" ;;
+    *)      step_label="system package cleanup"; step_title="system package cleanup"; supported_pkg_mgr=0 ;;
   esac
 
   if declare -F tui_step_begin >/dev/null 2>&1; then
@@ -432,8 +504,12 @@ run_cleanup_phase() {
   fi
   section "${step_title}"
   tool_card "cleanup" "$step_title"
-  if [ "$pkg_mgr" = "none" ]; then
-    skip_step "$step_label" "no supported Linux system package manager (apt/dnf/pacman/apk) detected"
+  if [ "$supported_pkg_mgr" -eq 0 ]; then
+    if [ "$pkg_mgr" = "none" ]; then
+      skip_step "$step_label" "no supported Linux system package manager (apt/dnf/pacman/zypper/apk/xbps) detected"
+    else
+      skip_step "$step_label" "system package cleanup not supported for ${pkg_mgr} (managed separately)"
+    fi
     step_status="SKIP"
   else
     printf '   %b%s%b %s\n\n' "${C_LABEL:-}" "upfront choice" "${C_RESET:-}" "${_ua_apt_cleanup_choice:-no}"

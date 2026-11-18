@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
 # Receipt rendering, dramatic WHAT CHANGED changelog table, and visual previews.
 # Public-safe: no hardcoded user home paths, private IPs, or secrets.
 
@@ -12,8 +13,6 @@
 : "${G_WARN:=▲}"
 : "${G_SAFETY:=◆}"
 : "${G_ARROW:=→}"
-: "${G_GUTTER:=│}"
-: "${G_CARD:=▌}"
 
 if ! declare -p _ua_delta_pkgs >/dev/null 2>&1; then
   declare -a _ua_delta_pkgs=()
@@ -215,7 +214,8 @@ _receipt_infer_pkg_and_via() {
 
 print_changed_story() {
   local bar="$1" i width table_w avail col_pkg col_bef col_aft col_via
-  local seg_pkg seg_bef seg_aft seg_via
+  local seg_pkg seg_bef seg_arr seg_aft seg_via
+  local h_ch="─" v_ch="│" tl="┌" tm="┬" tr="┐" ml="├" mm="┼" mr="┤" bl="└" bm="┴" br="┘" tbl_arrow="→"
   local -a rows_pkg=() rows_bef=() rows_aft=() rows_via=()
   local seen="|" pkg bef aft via lbl pkg_disp bef_disp aft_disp via_disp pkg_color
 
@@ -225,19 +225,6 @@ print_changed_story() {
   if [ "${#_ua_delta_pkgs[@]}" -gt 0 ]; then
     for ((i = 0; i < ${#_ua_delta_pkgs[@]}; i++)); do
       pkg="${_ua_delta_pkgs[$i]}"
-      [ -n "$pkg" ] || continue
-      bef="${_ua_delta_before[$i]:--}"
-      aft="${_ua_delta_after[$i]:--}"
-      via="${_ua_delta_via[$i]:-update-all}"
-      rows_pkg+=("$pkg")
-      rows_bef+=("$bef")
-      rows_aft+=("$aft")
-      rows_via+=("$via")
-      seen="${seen}${pkg}|"
-    done
-  elif declare -p _ua_delta_pkg >/dev/null 2>&1 && [ "${#_ua_delta_pkg[@]}" -gt 0 ]; then
-    for ((i = 0; i < ${#_ua_delta_pkg[@]}; i++)); do
-      pkg="${_ua_delta_pkg[$i]}"
       [ -n "$pkg" ] || continue
       bef="${_ua_delta_before[$i]:--}"
       aft="${_ua_delta_after[$i]:--}"
@@ -274,6 +261,21 @@ print_changed_story() {
     return 0
   fi
 
+  if [ "${_ua_utf8:-1}" -eq 0 ]; then
+    h_ch="-"
+    v_ch="|"
+    tl="+"
+    tm="+"
+    tr="+"
+    ml="+"
+    mm="+"
+    mr="+"
+    bl="+"
+    bm="+"
+    br="+"
+    tbl_arrow=">"
+  fi
+
   width="$(_receipt_rule_width)"
   table_w=$((width - 2))
   avail=$((table_w - 19))
@@ -286,25 +288,28 @@ print_changed_story() {
   col_pkg=$((avail - col_via - col_bef - col_aft))
   [ "$col_pkg" -lt 18 ] && col_pkg=18
 
-  seg_pkg="$(_receipt_repeat "─" "$((col_pkg + 4))")"
-  seg_bef="$(_receipt_repeat "─" "$((col_bef + 2))")"
-  seg_aft="$(_receipt_repeat "─" "$((col_aft + 2))")"
-  seg_via="$(_receipt_repeat "─" "$((col_via + 2))")"
+  seg_pkg="$(_receipt_repeat "$h_ch" "$((col_pkg + 4))")"
+  seg_bef="$(_receipt_repeat "$h_ch" "$((col_bef + 2))")"
+  seg_arr="$(_receipt_repeat "$h_ch" 3)"
+  seg_aft="$(_receipt_repeat "$h_ch" "$((col_aft + 2))")"
+  seg_via="$(_receipt_repeat "$h_ch" "$((col_via + 2))")"
 
-  printf '  %b┌%s┬%s┬───┬%s┬%s┐%b\n' "${C_FRAME:-}" "$seg_pkg" "$seg_bef" "$seg_aft" "$seg_via" "${C_RESET:-}"
-  printf '  %b│%b %b%-*s%b %b│%b %b%-*s%b %b│%b %b%s%b %b│%b %b%-*s%b %b│%b %b%-*s%b %b│%b\n' \
-    "${C_FRAME:-}" "${C_RESET:-}" \
+  printf '  %b%s%s%s%s%s%s%s%s%s%s%s%b\n' \
+    "${C_FRAME:-}" "$tl" "$seg_pkg" "$tm" "$seg_bef" "$tm" "$seg_arr" "$tm" "$seg_aft" "$tm" "$seg_via" "$tr" "${C_RESET:-}"
+  printf '  %b%s%b %b%-*s%b %b%s%b %b%-*s%b %b%s%b %b%s%b %b%s%b %b%-*s%b %b%s%b %b%-*s%b %b%s%b\n' \
+    "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
     "${C_HEADER:-}" "$((col_pkg + 2))" "PROGRAM / PACKAGE" "${C_RESET:-}" \
-    "${C_FRAME:-}" "${C_RESET:-}" \
+    "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
     "${C_HEADER:-}" "$col_bef" "BEFORE" "${C_RESET:-}" \
-    "${C_FRAME:-}" "${C_RESET:-}" \
-    "${C_ORANGE:-}" "$G_ARROW" "${C_RESET:-}" \
-    "${C_FRAME:-}" "${C_RESET:-}" \
+    "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
+    "${C_ORANGE:-}" "$tbl_arrow" "${C_RESET:-}" \
+    "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
     "${C_HEADER:-}" "$col_aft" "AFTER" "${C_RESET:-}" \
-    "${C_FRAME:-}" "${C_RESET:-}" \
+    "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
     "${C_HEADER:-}" "$col_via" "VIA" "${C_RESET:-}" \
-    "${C_FRAME:-}" "${C_RESET:-}"
-  printf '  %b├%s┼%s┼───┼%s┼%s┤%b\n' "${C_FRAME:-}" "$seg_pkg" "$seg_bef" "$seg_aft" "$seg_via" "${C_RESET:-}"
+    "${C_FRAME:-}" "$v_ch" "${C_RESET:-}"
+  printf '  %b%s%s%s%s%s%s%s%s%s%s%s%b\n' \
+    "${C_FRAME:-}" "$ml" "$seg_pkg" "$mm" "$seg_bef" "$mm" "$seg_arr" "$mm" "$seg_aft" "$mm" "$seg_via" "$mr" "${C_RESET:-}"
 
   for ((i = 0; i < ${#rows_pkg[@]}; i++)); do
     pkg_disp="$(receipt_value "${rows_pkg[$i]}" "$col_pkg")"
@@ -316,22 +321,23 @@ print_changed_story() {
     else
       pkg_color="${C_HEADER:-}"
     fi
-    printf '  %b│%b %b%s%b %b%-*s%b %b│%b %b%-*s%b %b│%b %b%s%b %b│%b %b%-*s%b %b│%b %b%-*s%b %b│%b\n' \
-      "${C_FRAME:-}" "${C_RESET:-}" \
+    printf '  %b%s%b %b%s%b %b%-*s%b %b%s%b %b%-*s%b %b%s%b %b%s%b %b%s%b %b%-*s%b %b%s%b %b%-*s%b %b%s%b\n' \
+      "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
       "${C_OK:-}" "$G_UPDATED" "${C_RESET:-}" \
       "$pkg_color" "$col_pkg" "$pkg_disp" "${C_RESET:-}" \
-      "${C_FRAME:-}" "${C_RESET:-}" \
+      "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
       "${C_VERSION_BEFORE:-}" "$col_bef" "$bef_disp" "${C_RESET:-}" \
-      "${C_FRAME:-}" "${C_RESET:-}" \
-      "${C_ORANGE:-}" "$G_ARROW" "${C_RESET:-}" \
-      "${C_FRAME:-}" "${C_RESET:-}" \
+      "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
+      "${C_ORANGE:-}" "$tbl_arrow" "${C_RESET:-}" \
+      "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
       "${C_VERSION_AFTER:-}" "$col_aft" "$aft_disp" "${C_RESET:-}" \
-      "${C_FRAME:-}" "${C_RESET:-}" \
+      "${C_FRAME:-}" "$v_ch" "${C_RESET:-}" \
       "${C_PATH:-}" "$col_via" "$via_disp" "${C_RESET:-}" \
-      "${C_FRAME:-}" "${C_RESET:-}"
+      "${C_FRAME:-}" "$v_ch" "${C_RESET:-}"
   done
 
-  printf '  %b└%s┴%s┴───┴%s┴%s┘%b\n' "${C_FRAME:-}" "$seg_pkg" "$seg_bef" "$seg_aft" "$seg_via" "${C_RESET:-}"
+  printf '  %b%s%s%s%s%s%s%s%s%s%s%s%b\n' \
+    "${C_FRAME:-}" "$bl" "$seg_pkg" "$bm" "$seg_bef" "$bm" "$seg_arr" "$bm" "$seg_aft" "$bm" "$seg_via" "$br" "${C_RESET:-}"
   printf '  %b%s UPDATED%b  %d upgraded item(s)\n' "${C_OK:-}" "$G_UPDATED" "${C_RESET:-}" "${#rows_pkg[@]}"
   printf '%b\n' "$bar"
 }
@@ -469,7 +475,7 @@ after_run_check_in() {
 }
 
 report() {
-  local width bar i updated=0 ok=0 unchanged=0 failed=0 skipped=0 security="${_ua_count_security:-0}"
+  local width bar rule_ch="─" start_s i updated=0 ok=0 unchanged=0 failed=0 skipped=0 security="${_ua_count_security:-0}"
   local lbl stat before after note icon color npm_active npm_bundled
 
   if declare -F tui_teardown >/dev/null 2>&1; then
@@ -477,7 +483,8 @@ report() {
   fi
 
   _ua_ended_s="$(date +%s)"
-  _ua_elapsed=$(( _ua_ended_s - ${_ua_started_s:-$_ua_ended_s} ))
+  start_s="${_ua_started_s:-$_ua_ended_s}"
+  _ua_elapsed=$(( _ua_ended_s - start_s ))
 
   for ((i = 0; i < ${#_ua_stats[@]}; i++)); do
     case "${_ua_stats[$i]}" in
@@ -491,7 +498,10 @@ report() {
 
   banner "RECEIPT"
   width="$(_receipt_rule_width)"
-  bar="${C_FRAME:-}$(_receipt_repeat "─" "$width")${C_RESET:-}"
+  if [ "${_ua_utf8:-1}" -eq 0 ]; then
+    rule_ch="-"
+  fi
+  bar="${C_FRAME:-}$(_receipt_repeat "$rule_ch" "$width")${C_RESET:-}"
 
   printf '%b\n' "$bar"
   printf '  %b%-16s%b %s\n' "${C_HEADER:-}" "started" "${C_RESET:-}" "${_ua_started_h:-unknown}"

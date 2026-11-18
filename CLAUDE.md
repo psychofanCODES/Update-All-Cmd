@@ -31,7 +31,7 @@ Personal-workstation tool — **not** fleet/server automation.
   - `shellcheck bin/update-all lib/*.sh install.sh scripts/build-standalone.sh tests/test-output-format.sh`
   - `bash tests/test-output-format.sh`
   - `./bin/update-all --dry-run --no-anim --no-color`
-  - `cspell README.md bin/update-all install.sh docs/UPDATE_ALL_HANDOFF.md cspell.json tests/test-output-format.sh CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md .github/*.md .github/*.yml .github/**/*.md .github/**/*.yml`
+  - `cspell README.md bin/update-all install.sh scripts/build-standalone.sh lib/*.sh docs/UPDATE_ALL_HANDOFF.md cspell.json tests/test-output-format.sh CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md .github/*.md .github/*.yml .github/**/*.md .github/**/*.yml`
 
 ## Gotchas
 - **Strict Bash 3.2 parse compatibility.** macOS ships Bash 3.2.57 while Linux ships Bash 5.x. Never use `${var,,}`, `declare -A`, `local -n`, `readarray`/`mapfile`, `|&`, or `coproc`; runtime-guard Bash 4+/5+ features (`BASH_VERSINFO[0]`).

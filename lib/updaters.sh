@@ -1,8 +1,9 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
 # Tracking, classification, delta extraction, and universal update phases.
 # Bash 3.2 parse-compatible; sourced by bin/update-all.
 
-UPDATE_ALL_BUILD_TIMEOUT="${UPDATE_ALL_BUILD_TIMEOUT:-900s}"
+UPDATE_ALL_BUILD_TIMEOUT="${UPDATE_ALL_BUILD_TIMEOUT:-1200s}"
 UPDATE_ALL_EDITOR_TIMEOUT="${UPDATE_ALL_EDITOR_TIMEOUT:-120s}"
 UPDATE_ALL_SNAP_TIMEOUT="${UPDATE_ALL_SNAP_TIMEOUT:-600s}"
 UPDATE_ALL_FLATPAK_TIMEOUT="${UPDATE_ALL_FLATPAK_TIMEOUT:-600s}"
@@ -326,6 +327,30 @@ extract_dnf_deltas() {
   done < <(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*Upgrading[[:space:]]*:[[:space:]]*([A-Za-z0-9_.+-]+)-([0-9][^-]*-[^[:space:]]+).*/\1|\2/p')
 }
 
+extract_zypper_deltas() {
+  local out="${1:-}" pkg ver
+  [ -n "$out" ] || return 0
+  while IFS='|' read -r pkg ver; do
+    [ -n "$pkg" ] && record_pkg_delta "$pkg" "prev" "$ver" "zypper"
+  done < <(printf '%s\n' "$out" | sed -nE 's/.*(Upgrading|Installing):[[:space:]]*([A-Za-z0-9_.+-]+)-([0-9][^-]*-[^[:space:]]+).*/\2|\3/p')
+}
+
+extract_apk_deltas() {
+  local out="${1:-}" pkg old new
+  [ -n "$out" ] || return 0
+  while IFS='|' read -r pkg old new; do
+    [ -n "$pkg" ] && record_pkg_delta "$pkg" "$old" "$new" "apk"
+  done < <(printf '%s\n' "$out" | sed -nE 's/.*Upgrading[[:space:]]+([^[:space:]]+)[[:space:]]+\(([^[:space:]]+)[[:space:]]+->[[:space:]]+([^)]+)\).*/\1|\2|\3/p')
+}
+
+extract_xbps_deltas() {
+  local out="${1:-}" pkg old new
+  [ -n "$out" ] || return 0
+  while IFS='|' read -r pkg old new; do
+    [ -n "$pkg" ] && record_pkg_delta "$pkg" "$old" "$new" "xbps"
+  done < <(printf '%s\n' "$out" | sed -nE 's/^([A-Za-z0-9_.+-]+)-([0-9][^:[:space:]]*):[[:space:]]+updating to[[:space:]]+([^[:space:]]+).*/\1|\2|\3/p')
+}
+
 # Non-interactive apt capture helper using runner.sh's sudo_cmd_capture.
 _ua_sudo_apt_capture() {
   local __var="$1"
@@ -345,7 +370,7 @@ _ua_sudo_apt_capture() {
 
 # --- Phase helpers (keep run_updates readable and modular) ---
 _ua_run_system_pkg_mgr() {
-  local before="" after="" out="" code=0 pkgs=""
+  local before="" after="" out="" code=0 pkgs="" delta_count_before=0 forced_status=""
   case "$_ua_sys_pkg_mgr" in
     apt-get)
       _ua_step_begin "dpkg" "dpkg audit"
@@ -432,11 +457,14 @@ _ua_run_system_pkg_mgr() {
       before="$(version_of dnf 2>/dev/null || true)"
       section "$_ua_sys_pkg_mgr upgrade"
       tool_card "dnf" "$_ua_sys_pkg_mgr OS packages" "$before" "$_ua_sys_pkg_mgr"
+      delta_count_before="${#_ua_delta_pkgs[@]}"
+      forced_status=""
       sudo_cmd_capture out "$_ua_sys_pkg_mgr" upgrade -y
       code=$?
       extract_dnf_deltas "$out"
+      [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
       after="$(version_of dnf 2>/dev/null || true)"
-      track "$_ua_sys_pkg_mgr upgrade" "$code" "$before" "$after"
+      track "$_ua_sys_pkg_mgr upgrade" "$code" "$before" "$after" "" "$forced_status"
       _ua_step_end "dnf-upgrade"
       ;;
     pacman)
@@ -444,11 +472,14 @@ _ua_run_system_pkg_mgr() {
       before="$(version_of pacman 2>/dev/null || true)"
       section "pacman upgrade"
       tool_card "pacman" "Arch OS packages" "$before" "pacman"
+      delta_count_before="${#_ua_delta_pkgs[@]}"
+      forced_status=""
       sudo_cmd_capture out pacman -Syu --noconfirm
       code=$?
       extract_pacman_deltas "$out"
+      [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
       after="$(version_of pacman 2>/dev/null || true)"
-      track "pacman -Syu" "$code" "$before" "$after" "official Arch repos only; AUR stays manual"
+      track "pacman -Syu" "$code" "$before" "$after" "official Arch repos only; AUR stays manual" "$forced_status"
       _ua_step_end "pacman-upgrade"
       ;;
     zypper)
@@ -458,10 +489,14 @@ _ua_run_system_pkg_mgr() {
       tool_card "zypper" "openSUSE OS packages" "$before" "zypper"
       local zyp_sub="up"
       case "$_ua_distro_id $_ua_distro_name" in *tumbleweed*|*Tumbleweed*) zyp_sub="dup" ;; esac
-      sudo_cmd zypper --non-interactive "$zyp_sub"
+      delta_count_before="${#_ua_delta_pkgs[@]}"
+      forced_status=""
+      sudo_cmd_capture out zypper --non-interactive "$zyp_sub"
       code=$?
+      extract_zypper_deltas "$out"
+      [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
       after="$(version_of zypper 2>/dev/null || true)"
-      track "zypper $zyp_sub" "$code" "$before" "$after"
+      track "zypper $zyp_sub" "$code" "$before" "$after" "" "$forced_status"
       _ua_step_end "zypper-upgrade"
       ;;
     apk)
@@ -469,10 +504,18 @@ _ua_run_system_pkg_mgr() {
       before="$(version_of apk 2>/dev/null || true)"
       section "apk upgrade"
       tool_card "apk" "Alpine OS packages" "$before" "apk"
-      sudo_cmd apk update && sudo_cmd apk upgrade
+      delta_count_before="${#_ua_delta_pkgs[@]}"
+      forced_status=""
+      sudo_cmd apk update
       code=$?
+      if [ "$code" -eq 0 ]; then
+        sudo_cmd_capture out apk upgrade
+        code=$?
+        extract_apk_deltas "$out"
+        [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
+      fi
       after="$(version_of apk 2>/dev/null || true)"
-      track "apk upgrade" "$code" "$before" "$after"
+      track "apk upgrade" "$code" "$before" "$after" "" "$forced_status"
       _ua_step_end "apk-upgrade"
       ;;
     xbps-install)
@@ -480,10 +523,14 @@ _ua_run_system_pkg_mgr() {
       before="$(version_of xbps 2>/dev/null || true)"
       section "xbps upgrade"
       tool_card "xbps" "Void OS packages" "$before" "xbps-install"
-      sudo_cmd xbps-install -Suy
+      delta_count_before="${#_ua_delta_pkgs[@]}"
+      forced_status=""
+      sudo_cmd_capture out xbps-install -Suy
       code=$?
+      extract_xbps_deltas "$out"
+      [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
       after="$(version_of xbps 2>/dev/null || true)"
-      track "xbps-install -Suy" "$code" "$before" "$after"
+      track "xbps-install -Suy" "$code" "$before" "$after" "" "$forced_status"
       _ua_step_end "xbps-upgrade"
       ;;
     *)
@@ -514,7 +561,7 @@ _ua_run_editor_step() {
 }
 
 run_updates() {
-  local before="" after="" code=0 out="" owner=""
+  local before="" after="" code=0 out="" owner="" delta_count_before=0 forced_status=""
   [ "${_ua_env_discovered:-0}" = 1 ] || discover_environment
   show_update_coverage_preflight
 
@@ -527,6 +574,8 @@ run_updates() {
     before="$(version_of snap 2>/dev/null || true)"
     section "snap refresh"
     tool_card "snap" "snap packages" "$before"
+    delta_count_before="${#_ua_delta_pkgs[@]}"
+    forced_status=""
     if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
       show_cmd sudo snap refresh
       code=0; out=""
@@ -535,8 +584,9 @@ run_updates() {
       code=$?
     fi
     extract_snap_deltas "$out"
+    [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
     after="$(version_of snap 2>/dev/null || true)"
-    track "snap refresh" "$code" "$before" "$after"
+    track "snap refresh" "$code" "$before" "$after" "" "$forced_status"
     _ua_step_end "snap"
   else
     skip_tool "snap" "snap packages" "snap refresh" "snap command not installed" "snap"
@@ -547,11 +597,14 @@ run_updates() {
     before="$(version_of flatpak 2>/dev/null || true)"
     section "flatpak update"
     tool_card "flatpak" "flatpak apps" "$before"
+    delta_count_before="${#_ua_delta_pkgs[@]}"
+    forced_status=""
     UPDATE_ALL_STEP_TIMEOUT="$UPDATE_ALL_FLATPAK_TIMEOUT" run_cmd_capture out flatpak update -y --noninteractive
     code=$?
     extract_flatpak_deltas "$out"
+    [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
     after="$(version_of flatpak 2>/dev/null || true)"
-    track "flatpak update" "$code" "$before" "$after"
+    track "flatpak update" "$code" "$before" "$after" "" "$forced_status"
     _ua_step_end "flatpak"
   else
     skip_tool "flatpak" "flatpak apps" "flatpak update" "flatpak command not installed" "flatpak"
@@ -572,7 +625,11 @@ run_updates() {
       local fw_updates_output="" fw_update_output="" fw_refresh=0 fw_updates=0 fw_update=0
       run_cmd fwupdmgr refresh --force
       fw_refresh=$?
-      run_cmd_capture_quiet fw_updates_output fwupdmgr get-updates
+      if declare -F ua_exec_watched >/dev/null 2>&1; then
+        ua_exec_watched --capture fw_updates_output --quiet --timeout "${UPDATE_ALL_STEP_TIMEOUT:-600s}" -- fwupdmgr get-updates
+      else
+        run_cmd_capture fw_updates_output fwupdmgr get-updates
+      fi
       fw_updates=$?
       print_firmware_summary "$fw_updates_output"
       after="$(version_of fwupd 2>/dev/null || true)"
@@ -644,6 +701,22 @@ run_updates() {
     tool_card "volta" "Volta Node manager" "$before" "volta"
     track "volta toolchain" "OK" "$before" "$before" "Volta pins Node versions per project; run volta install node@lts manually to bump default"
     _ua_step_end "volta"
+  fi
+
+  if [ "$_ua_has_fnm" = 1 ]; then
+    _ua_step_begin "fnm" "fnm Node manager"
+    before="$(version_of fnm 2>/dev/null || true)"
+    section "fnm Node manager"
+    tool_card "fnm" "FNM NODE MANAGER" "$before" "fnm"
+    local fnm_list=""
+    if [ "$UPDATE_ALL_DRY_RUN" != 1 ]; then
+      fnm_list="$(_ua_probe_bounded fnm list 2>/dev/null | awk '{sub(/^[[:space:]]*/, ""); sub(/^\*[[:space:]]*/, ""); if (length($0) > 0) { if (out != "") out = out ", "; out = out $0 }} END { print out }' || true)"
+      if [ -n "$fnm_list" ]; then
+        printf '   %b%-15s%b %s\n' "$C_LABEL" "installed" "$C_RESET" "$fnm_list"
+      fi
+    fi
+    track "fnm" "OK" "$before" "$before" "fnm manages project-pinned Node versions; run fnm install --lts manually to add a runtime without surprise switching"
+    _ua_step_end "fnm"
   fi
 
   if [ "$_ua_has_corepack" = 1 ]; then
@@ -957,11 +1030,14 @@ run_updates() {
     before="$(version_of pipx 2>/dev/null || true)"
     section "pipx upgrade-all"
     tool_card "pipx" "pipx Python CLIs" "$before"
+    delta_count_before="${#_ua_delta_pkgs[@]}"
+    forced_status=""
     run_cmd_capture out env PIP_NO_INPUT=1 pipx upgrade-all
     code=$?
     extract_pipx_deltas "$out"
+    [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ] && forced_status="UPDATED"
     after="$(version_of pipx 2>/dev/null || true)"
-    track "pipx upgrade-all" "$code" "$before" "$after"
+    track "pipx upgrade-all" "$code" "$before" "$after" "" "$forced_status"
     _ua_step_end "pipx"
   else
     skip_tool "pipx" "pipx Python CLIs" "pipx upgrade-all" "pipx command not installed" "pipx"
@@ -1027,13 +1103,11 @@ run_updates() {
   fi
 
   # ===== CLEANUP =====
-  declare -F tui_set_phase >/dev/null 2>&1 && tui_set_phase "CLEANUP"
   if declare -F run_cleanup_phase >/dev/null 2>&1; then
     run_cleanup_phase
   fi
 
   # ===== SAFETY COACH =====
-  declare -F tui_set_phase >/dev/null 2>&1 && tui_set_phase "SAFETY"
   if declare -F run_safety_coach_scan >/dev/null 2>&1; then
     run_safety_coach_scan
   fi

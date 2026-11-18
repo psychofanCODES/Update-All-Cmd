@@ -1,6 +1,8 @@
 # shellcheck shell=bash
 # Zero-stall command runner, streaming redactor, and sudo engine for update-all.
 # Strictly Bash 3.2+ parse-compatible (macOS bash 3.2.57 & Linux bash 5.x).
+# Cross-module globals (palette, glyphs, TUI state, selftest flags) are shared with bin/update-all and sibling libs.
+# shellcheck disable=SC2034,SC2154
 
 UPDATE_ALL_STEP_TIMEOUT="${UPDATE_ALL_STEP_TIMEOUT:-600s}"
 UPDATE_ALL_PROBE_TIMEOUT="${UPDATE_ALL_PROBE_TIMEOUT:-15s}"
@@ -10,12 +12,12 @@ UPDATE_ALL_NONINTERACTIVE="${UPDATE_ALL_NONINTERACTIVE:-0}"
 _ua_tmp_dir="${_ua_tmp_dir:-}"; _ua_runtime_initialized="${_ua_runtime_initialized:-0}"
 _ua_tools_probed="${_ua_tools_probed:-0}"; _ua_has_timeout="${_ua_has_timeout:-0}"
 _ua_has_timeout_k="${_ua_has_timeout_k:-0}"; _ua_has_stdbuf="${_ua_has_stdbuf:-0}"
-_ua_exiting="${_ua_exiting:-0}"; _ua_interrupted="${_ua_interrupted:-0}"
+_ua_exiting="${_ua_exiting:-0}"
 _ua_tui_resized="${_ua_tui_resized:-0}"; _ua_fifo_seq="${_ua_fifo_seq:-0}"
 _ua_active_cmd_pid="${_ua_active_cmd_pid:-}"; _ua_active_filter_pid="${_ua_active_filter_pid:-}"
 _ua_sudo_keepalive_pid="${_ua_sudo_keepalive_pid:-}"; _ua_sudo_keepalive_stopped="${_ua_sudo_keepalive_stopped:-0}"
 _ua_needs_sudo="${_ua_needs_sudo:-0}"
-_ua_last_tick_cs=0; _ua_last_tick_s=-1; _ua_last_output_line=""
+_ua_last_tick_cs=0; _ua_last_tick_s=-1; _ua_w_tick=0
 
 _UA_SECRET_HINT_RE='(sk-|github_pat_|gh[pousr]_|xox[baprs]-|AKIA[0-9A-Z]{16}|PRIVATE KEY-----|(TOKEN|PASSWORD|PASS|SECRET|API_KEY|APIKEY|ACCESS_KEY)[A-Za-z0-9_]*[[:space:]]*=)'
 
@@ -38,12 +40,21 @@ _ua_probe_runner_tools() {
 }
 
 _ua_reap_pid() {
-  local pid="${1:-}"
+  local pid="${1:-}" grace_tenths="${2:-15}" i=0
   [ -n "$pid" ] || return 0
+  case "$grace_tenths" in
+    *[!0-9]*|"") grace_tenths=15 ;;
+  esac
   if kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid" 2>/dev/null || true
+    while [ "$i" -lt "$grace_tenths" ] && kill -0 "$pid" 2>/dev/null; do
+      if ! sleep 0.1 2>/dev/null; then
+        sleep 1 2>/dev/null || true
+        break
+      fi
+      i=$(( i + 1 ))
+    done
     if kill -0 "$pid" 2>/dev/null; then
-      sleep 0.05 2>/dev/null || true
       kill -KILL "$pid" 2>/dev/null || true
     fi
   fi
@@ -61,7 +72,6 @@ ua_init_runtime() {
   _ua_tmp_dir="$(mktemp -d "${base_tmp}/update-all.XXXXXX")"
   chmod 700 "$_ua_tmp_dir"
   _ua_exiting=0
-  _ua_interrupted=0
   _ua_runtime_initialized=1
 
   trap '_ua_on_exit' EXIT
@@ -74,9 +84,9 @@ _ua_on_exit() {
   [ "${_ua_exiting:-0}" -eq 0 ] || return 0
   _ua_exiting=1
 
-  _ua_reap_pid "${_ua_active_cmd_pid:-}"
+  _ua_reap_pid "${_ua_active_cmd_pid:-}" 15
   _ua_active_cmd_pid=""
-  _ua_reap_pid "${_ua_active_filter_pid:-}"
+  _ua_reap_pid "${_ua_active_filter_pid:-}" 1
   _ua_active_filter_pid=""
 
   sudo_keepalive_stop
@@ -91,7 +101,6 @@ _ua_on_exit() {
 
 _ua_on_signal() {
   local sig="${1:-INT}" code="${2:-130}"
-  _ua_interrupted=1
   trap - INT TERM
   _ua_on_exit
   if [ "$sig" = "INT" ]; then
@@ -160,7 +169,7 @@ color_log_line() {
   if [ "${UPDATE_ALL_DRY_RUN:-0}" != 1 ] && [ "${UPDATE_ALL_REDACTION_SELFTEST:-0}" != 1 ] \
     && [ "${UPDATE_ALL_STDIN_SELFTEST:-0}" != 1 ] && [ -z "${UPDATE_ALL_SUDO_SELFTEST:-}" ] \
     && declare -F tui_bar_enabled >/dev/null 2>&1 && tui_bar_enabled; then
-    prefix="${C_FRAME:-}    │ ${C_RESET:-}"
+    prefix="${C_FRAME:-}    ${G_GUTTER:-│} ${C_RESET:-}"
   fi
 
   local had_nocasematch=0 color="${C_LOG:-}"
@@ -212,8 +221,20 @@ color_log_stream() {
 # ---------------------------------------------------------------------------
 # 3. Single-Writer Live Concurrent Watcher Engine
 # ---------------------------------------------------------------------------
+_ua_now_cs_into() {
+  local __var="$1" raw="${2:-${EPOCHREALTIME:-}}"
+  [ -n "$raw" ] || return 1
+  raw="${raw/[.,]/}"
+  case "$raw" in
+    *[!0-9]*|"") return 1 ;;
+  esac
+  [ "${#raw}" -gt 4 ] || return 1
+  printf -v "$__var" '%s' "${raw:0:${#raw}-4}"
+  return 0
+}
+
 _ua_watcher_tick() {
-  local label="${1:-}" force="${2:-0}"
+  local cmd_start_s="${1:-0}" last_out_s="${2:-0}" label="${3:-}" force="${4:-0}"
 
   if [ "${_ua_tui_resized:-0}" -eq 1 ]; then
     _ua_tui_resized=0
@@ -221,22 +242,48 @@ _ua_watcher_tick() {
   fi
 
   [ "${UPDATE_ALL_DRY_RUN:-0}" != 1 ] || return 0
-  declare -F tui_draw_dock >/dev/null 2>&1 || return 0
 
+  local use_dock=0 use_inline=0
+  if [ "${_ua_tui_active:-0}" -eq 1 ]; then
+    if [ "${_ua_tui_paused:-0}" -eq 0 ] && declare -F tui_draw_dock >/dev/null 2>&1; then
+      use_dock=1
+    fi
+  elif declare -F anim_enabled >/dev/null 2>&1 && anim_enabled \
+    && declare -F tui_draw_inline_watcher >/dev/null 2>&1; then
+    use_inline=1
+  fi
+  [ "$use_dock" -eq 1 ] || [ "$use_inline" -eq 1 ] || return 0
+
+  local now_cs=""
   if [ "$force" -eq 0 ]; then
-    if [ "${BASH_VERSINFO[0]:-3}" -ge 5 ] && [ -n "${EPOCHREALTIME:-}" ]; then
-      local now_cs="${EPOCHREALTIME/./}"
-      now_cs="${now_cs:0:${#now_cs}-4}"
-      [ $(( now_cs - _ua_last_tick_cs )) -lt 10 ] && return 0
+    if [ "${BASH_VERSINFO[0]:-3}" -ge 5 ] && _ua_now_cs_into now_cs; then
+      [ $(( 10#$now_cs - 10#${_ua_last_tick_cs:-0} )) -lt 10 ] && return 0
       _ua_last_tick_cs="$now_cs"
     else
-      local now_s="${SECONDS:-0}"
-      [ "$now_s" -eq "${_ua_last_tick_s:--1}" ] && return 0
-      _ua_last_tick_s="$now_s"
+      local now_s_chk="${SECONDS:-0}"
+      [ "$now_s_chk" -eq "${_ua_last_tick_s:--1}" ] && return 0
+      _ua_last_tick_s="$now_s_chk"
+    fi
+  else
+    if [ "${BASH_VERSINFO[0]:-3}" -ge 5 ] && _ua_now_cs_into now_cs; then
+      _ua_last_tick_cs="$now_cs"
+    else
+      _ua_last_tick_s="${SECONDS:-0}"
     fi
   fi
 
-  tui_draw_dock "$label"
+  local now_s="${SECONDS:-0}" elapsed=0 silence=0
+  elapsed=$(( now_s - cmd_start_s ))
+  [ "$elapsed" -lt 0 ] && elapsed=0
+  silence=$(( now_s - last_out_s ))
+  [ "$silence" -lt 0 ] && silence=0
+  _ua_w_tick=$(( _ua_w_tick + 1 ))
+
+  if [ "$use_dock" -eq 1 ]; then
+    tui_draw_dock "$_ua_w_tick" "$elapsed" "$silence" 1
+  else
+    tui_draw_inline_watcher "$_ua_w_tick" "$elapsed" "$silence" "$label"
+  fi
 }
 
 _ua_emit_watched_line() {
@@ -248,8 +295,13 @@ _ua_emit_watched_line() {
 
   _ua_redact_into line "$line"
   [ -n "$cap_file" ] && printf '%s\n' "$line" >> "$cap_file"
-  [ "$quiet" -eq 0 ] && color_log_line "$line"
-  [ -n "$line" ] && _ua_last_output_line="$line"
+  if [ "$quiet" -eq 0 ]; then
+    if [ "${_ua_tui_active:-0}" -eq 0 ] && [ "${_ua_tui_inline_visible:-0}" -eq 1 ] \
+      && declare -F tui_clear_inline_watcher >/dev/null 2>&1; then
+      tui_clear_inline_watcher
+    fi
+    color_log_line "$line"
+  fi
 }
 
 _ua_exec_fallback() {
@@ -352,8 +404,13 @@ ua_exec_watched() {
   local monitor_was_on=0
   case "$-" in *m*) monitor_was_on=1; set +m ;; esac
 
-  _ua_strip_nul_stream < "$raw_fifo" > "$out_fifo" &
-  local filter_pid=$!
+  local filter_pid=""
+  if [ "${_ua_has_stdbuf:-0}" -eq 1 ]; then
+    stdbuf -i0 -o0 tr -d '\000' < "$raw_fifo" > "$out_fifo" &
+  else
+    tr -d '\000' < "$raw_fifo" > "$out_fifo" &
+  fi
+  filter_pid=$!
   _ua_active_filter_pid="$filter_pid"
 
   local cmd_pid=""
@@ -366,8 +423,16 @@ ua_exec_watched() {
   _ua_active_cmd_pid="$cmd_pid"
   [ "$monitor_was_on" -eq 1 ] && set -m
 
+  local prev_w_tick="${_ua_w_tick:-0}" saved_step_label=0
+  _ua_w_tick=0
+  local cmd_start_s="${SECONDS:-0}" last_out_s="${SECONDS:-0}"
+  if [ -n "$label" ] && [ -z "${_ua_tui_step_label:-}" ]; then
+    _ua_tui_step_label="$label"
+    saved_step_label=1
+  fi
+
   exec 3< "$out_fifo"
-  _ua_watcher_tick "$label" 1
+  _ua_watcher_tick "$cmd_start_s" "$last_out_s" "$label" 1
 
   local line="" pending="" read_rc=0 dead_ticks=0 is_bash4=0
   [ "${BASH_VERSINFO[0]:-3}" -ge 4 ] && is_bash4=1
@@ -383,9 +448,10 @@ ua_exec_watched() {
 
     if [ "$read_rc" -eq 0 ]; then
       dead_ticks=0
+      last_out_s="${SECONDS:-0}"
       if [ -n "$pending" ]; then line="${pending}${line}"; pending=""; fi
       _ua_emit_watched_line "$line" "$cap_file" "$quiet"
-      _ua_watcher_tick "$label" 0
+      _ua_watcher_tick "$cmd_start_s" "$last_out_s" "$label" 0
       continue
     fi
 
@@ -396,10 +462,11 @@ ua_exec_watched() {
     fi
 
     if [ -n "$line" ]; then
+      last_out_s="${SECONDS:-0}"
       pending="${pending}${line}"
       [[ "$pending" == *$'\r'* ]] && _ua_normalize_cr_into pending "$pending"
     fi
-    _ua_watcher_tick "$label" 0
+    _ua_watcher_tick "$cmd_start_s" "$last_out_s" "$label" 0
 
     if [ "$is_bash4" -eq 1 ]; then
       if ! kill -0 "$cmd_pid" 2>/dev/null; then
@@ -425,13 +492,16 @@ ua_exec_watched() {
   done
 
   exec 3<&-
+  declare -F tui_clear_inline_watcher >/dev/null 2>&1 && tui_clear_inline_watcher
+  _ua_w_tick="$prev_w_tick"
+  [ "$saved_step_label" -eq 1 ] && _ua_tui_step_label=""
 
   local cmd_rc=0
   wait "$cmd_pid" 2>/dev/null || cmd_rc=$?
   _ua_active_cmd_pid=""
 
   if kill -0 "$filter_pid" 2>/dev/null; then
-    _ua_reap_pid "$filter_pid"
+    _ua_reap_pid "$filter_pid" 1
   else
     wait "$filter_pid" 2>/dev/null || true
   fi
@@ -520,12 +590,12 @@ _ua_sudo_exec() {
     ua_exec_watched "${watch_args[@]}" -- "$@"
     return $?
   fi
-  if sudo_secret_available; then
-    ua_exec_watched "${watch_args[@]}" --stdin-secret "$UPDATE_ALL_SUDO_SECRET_KEY" -- sudo -S -p '' "$@"
+  if sudo -n true </dev/null 2>/dev/null; then
+    ua_exec_watched "${watch_args[@]}" -- sudo -n "$@"
     return $?
   fi
-  if sudo -n true 2>/dev/null; then
-    ua_exec_watched "${watch_args[@]}" -- sudo -n "$@"
+  if sudo_secret_available; then
+    ua_exec_watched "${watch_args[@]}" --stdin-secret "$UPDATE_ALL_SUDO_SECRET_KEY" -- sudo -S -p '' "$@"
     return $?
   fi
 

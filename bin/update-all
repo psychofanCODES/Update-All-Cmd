@@ -2,6 +2,7 @@
 # Universal, local-first Linux workstation updater with live TUI dock and Safety Coach.
 # Public-safe: no secrets are stored here; an optional `secret` helper may supply
 # sudo only when it already exists on the host.
+# shellcheck disable=SC2034 # Shared config and state globals are read by sourced lib/*.sh modules.
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
@@ -46,20 +47,11 @@ _ua_tui_resized=0
 _ua_tui_compact=0
 _ua_utf8=1
 
-_ua_step_index=0
 _ua_step_total=0
-_ua_phase_name="PREFLIGHT"
-_ua_current_step_key=""
-_ua_current_step_label=""
-_ua_current_step_start_s=0
-_ua_total_est_secs=0
-_ua_done_est_secs=0
 
 _ua_count_updated=0
 _ua_count_ok=0
 _ua_count_unchanged=0
-_ua_count_skipped=0
-_ua_count_failed=0
 _ua_count_security=0
 _ua_reclaimed_kb=0
 
@@ -143,12 +135,11 @@ declare -a _ua_sec_alt_cmd=()
 declare -a _ua_timing_keys=()
 declare -a _ua_timing_secs=()
 declare -a _ua_planned_keys=()
-declare -a _ua_run_timing_keys=()
-declare -a _ua_run_timing_secs=()
 
 # ---------------------------------------------------------------------------
-# Module loader (skipped automatically in standalone bundled builds)
+# Module loader (replaced inline by scripts/build-standalone.sh in dist builds)
 # ---------------------------------------------------------------------------
+# __UA_BUNDLE_LOADER_BEGIN__
 _ua_resolve_script_dir() {
   local src="${BASH_SOURCE[0]}" dir target
   while [ -L "$src" ]; do
@@ -183,6 +174,7 @@ if [ "${_UA_BUNDLED:-0}" != 1 ]; then
   done
   unset _ua_bin_dir _ua_lib_dir _ua_mod
 fi
+# __UA_BUNDLE_MODULES_HERE__
 
 # ---------------------------------------------------------------------------
 # CLI usage & argument parsing
@@ -383,6 +375,7 @@ _ua_run_selftests() {
       stream-capture)
         local cap_out="" cap_rc=0 syn_tok
         syn_tok="sk-""1234567890abcdefghijklmno"
+        # shellcheck disable=SC2016
         run_cmd_capture cap_out bash -c 'printf "line-one\n"; sleep 0.2; printf "token=%s\000tail\n" "$1"; exit 7' _ "$syn_tok"
         cap_rc=$?
         printf 'CAPTURE_RC=%s\n' "$cap_rc"
