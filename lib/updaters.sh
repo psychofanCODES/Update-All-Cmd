@@ -951,12 +951,13 @@ run_updates() {
       show_brew_tap_trust_preflight || true
     fi
     show_pending_brew_updates
-    local brew_output="" brew_code=0
+    local brew_output="" brew_code=0 delta_count_before=0
     run_shell_capture brew_output 'HOMEBREW_NO_ENV_HINTS=1 brew update && HOMEBREW_NO_ENV_HINTS=1 brew upgrade'
     brew_code=$?
+    delta_count_before="${#_ua_delta_pkgs[@]}"
     extract_brew_deltas "$brew_output"
     after="$(version_of brew 2>/dev/null || true)"
-    if printf '%s\n' "$brew_output" | output_implies_update; then
+    if printf '%s\n' "$brew_output" | output_implies_update || [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ]; then
       local brew_delta="" brew_name="" brew_old="" brew_new=""
       brew_delta="$(printf '%s\n' "$brew_output" | first_arrow_delta)"
       if [ -n "$brew_delta" ]; then

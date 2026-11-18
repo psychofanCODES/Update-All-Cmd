@@ -19,10 +19,10 @@ Linux Bash 5.x, with runtime `BASH_VERSINFO[0]` guards for Bash 4+/5+ features):
 - `lib/runner.sh` — zero-stall FIFO-backed concurrent watcher loop (`stdbuf -oL -eL`, `timeout -k`), fast-path secret redactor, closed-stdin (`</dev/null`) execution, `sudo` keepalive, and non-interactive apt wrapper.
 - `lib/discover.sh` — `/etc/os-release` host/distro discovery, safe `PATH` augmentation, bounded version probes, `COVERAGE PREFLIGHT`, and upfront optional choice collection.
 - `lib/updaters.sh` — universal Linux package-manager and dev-tool updaters with before/after tracking and per-package delta capture for the receipt table.
-- `lib/cleanup.sh` — distro-aware system package cleanup (`apt`/`dnf`/`pacman`/`apk`) and safe bounded workstation cache cleanup with reclaimed disk space tracking.
-- `lib/safety_coach.sh` — cached Homebrew tap trust inspection, OSV.dev batch advisory/malicious-package audit (`MAL-*`, Critical/High CVEs/GHSAs), read-only open-port & firewall check, and guided post-receipt remediation walkthrough.
+- `lib/cleanup.sh` — distro-aware system package cleanup (`apt`/`dnf`/`pacman`/`zypper`/`apk`/`xbps`) and safe bounded workstation cache cleanup with reclaimed disk space tracking.
+- `lib/safety_coach.sh` — cached Homebrew tap trust inspection, OSV.dev batch advisory/malicious-package audit (`MAL-*`, Critical/High CVEs/GHSAs with CVSS v3.0/v3.1 base-score evaluation), read-only open-port & firewall check, and guided post-receipt remediation walkthrough.
 - `lib/receipt.sh` — upgraded `RECEIPT` summary + reclaimed disk space, dramatic Unicode `WHAT CHANGED` table (`PROGRAM / PACKAGE | BEFORE → AFTER | VIA`), `NEEDS YOUR ATTENTION`, compact `NO ACTION NEEDED`, `RUN DETAILS`, `CLEANUP NEXT STEPS`, and `AFTER-RUN CHECK-IN`.
-- `scripts/build-standalone.sh` — concatenates `lib/*.sh` + `bin/update-all` with `_UA_BUNDLED=1` into standalone `dist/update-all`.
+- `scripts/build-standalone.sh` — embeds `lib/*.sh` modules inline at `# __UA_BUNDLE_MODULES_HERE__` inside `bin/update-all` (replacing the module loader with `_UA_BUNDLED=1`) to produce standalone `dist/update-all` (`0755`).
 
 ## Current Product Direction
 
@@ -75,7 +75,9 @@ Cleanup stays opt-in and split into two explicit choices (auto-approved with `-a
    - `apt`: `apt-get autoremove --purge -y`, `apt-get autoclean`, `apt-get clean`
    - `dnf`: `dnf autoremove -y`, `dnf clean packages`
    - `pacman`: `pacman -Sc --noconfirm`
+   - `zypper`: `zypper --non-interactive clean --all`
    - `apk`: `apk cache clean`
+   - `xbps`: `xbps-remove -Ooy`
 2. **Bounded workstation cache cleanup** (explicit safe targets only — **no slow full-`$HOME` crawl**):
    - `npm cache clean --force`, `rm -rf -- ~/.npm/_npx`
    - `pip3 cache purge`, `brew cleanup -s`, `timeout 20s uv cache prune`
@@ -89,7 +91,7 @@ Before/after disk footprints are measured via bounded `du -sk` and reported as r
 
 Safety Coach Mode runs after updates (unless `--no-security-scan` or `UPDATE_ALL_SECURITY_SCAN=0`):
 
-- **OSV.dev package audit (`scan_osv_packages`):** Queries `https://api.osv.dev/v1/querybatch` with global `npm`, `uv`, `pipx`, `cargo`, and `brew` tuples — sending ONLY `(package name, ecosystem, version)`. Flags OpenSSF `MAL-*` malicious packages (`CRITICAL`) and `CRITICAL`/`HIGH` advisories (`GHSA-*`, `CVE-*`). Fails open safely (`SKIP`) when offline.
+- **OSV.dev package audit (`scan_osv_packages`):** Queries `https://api.osv.dev/v1/querybatch` with global `npm`, `PyPI` (`uv`/`pipx`), and `crates.io` (`cargo`) tuples — sending ONLY `(package name, ecosystem, version)` (Homebrew is covered by native `brew tap-info` trust preflight and `brew upgrade`). Flags OpenSSF `MAL-*` malicious packages (`CRITICAL`) and `CRITICAL`/`HIGH` advisories (`GHSA-*`, `CVE-*`, `PYSEC-*`, `RUSTSEC-*`, including CVSS v3.0/v3.1 base-score vectors). Fails open safely (`SKIP`) when offline.
 - **Open-port & firewall audit (`scan_public_ports`):** Read-only `ss -tulnpH` / `netstat` inspection plus `ufw`/`firewalld` status check; flags non-loopback listeners (`0.0.0.0`, `::`, LAN) with plain-English bind descriptions.
 - **Homebrew tap trust (`inspect_brew_tap_trust` / `show_brew_tap_trust_preflight`):** Cached `brew tap-info` check with plain-English `INSIGHT` panels for `Untrusted` taps.
 - **Guided post-receipt walkthrough (`run_safety_coach_remedy`):** Displays `◆ SAFETY COACH — ISSUES FOUND (N)` and offers `[1]` recommended fix, `[2]` alternate/inspect, `[3]` skip, `[q]` exit. Never auto-deletes packages or edits firewall rules — even under `--all`. Rejects shell metacharacters before executing any remedy command.

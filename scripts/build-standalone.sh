@@ -60,7 +60,7 @@ if [ "$marker_seen" -ne 1 ]; then
   exit 1
 fi
 
-chmod +x "$tmp_file"
+chmod 0755 "$tmp_file"
 bash -n "$tmp_file"
 mv -f -- "$tmp_file" "$out_file"
 printf 'Built standalone bundle -> %s (%s lines)\n' "$out_file" "$(wc -l < "$out_file" | tr -d ' ')"

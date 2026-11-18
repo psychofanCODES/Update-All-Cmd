@@ -400,7 +400,7 @@ cleanup_status_for() {
   if [ "$label" = "apt autoremove" ]; then
     for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
       case "${_ua_labels[$i]}" in
-        "dnf autoremove"|"pacman cache clean"|"apk cache clean")
+        "dnf5 autoremove"|"dnf autoremove"|"yum autoremove"|"pacman cache clean"|"zypper cleanup"|"apk cache clean"|"xbps cleanup"|"system package cleanup")
           printf '%s' "${_ua_stats[$i]}"
           return 0
           ;;
@@ -421,7 +421,7 @@ cleanup_note_for() {
   if [ "$label" = "apt autoremove" ]; then
     for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
       case "${_ua_labels[$i]}" in
-        "dnf autoremove"|"pacman cache clean"|"apk cache clean")
+        "dnf5 autoremove"|"dnf autoremove"|"yum autoremove"|"pacman cache clean"|"zypper cleanup"|"apk cache clean"|"xbps cleanup"|"system package cleanup")
           printf '%s' "${_ua_notes[$i]}"
           return 0
           ;;

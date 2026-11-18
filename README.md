@@ -33,10 +33,10 @@ update-all
 - **Anchored 2-row TUI dock & kinetic watcher:** Pins a live progress bar at the bottom (`--bar=bottom`, or `--bar=top` / `--bar=off`) with self-calibrating EWMA ETAs persisted to `${XDG_CACHE_HOME:-~/.cache}/update-all/timings.tsv`, `SIGWINCH` dynamic terminal resize handling, compact min-size adaptation, live status counters (`↗ ✓ = · ✗`), and a monochrome pulsing watcher (`--watcher=hybrid` combining star + braille wave, `--watcher=braille`, or `--watcher=anthropic`).
 - **Refined visual hierarchy:** Signature amber `UPDATE ALL` banner with dark-teal binary divider, monochrome Unicode glyphs (`↗ ✓ = ✗ · ▲ ◆ → │ ▌`) with automatic ASCII fallback (`UPDATE_ALL_ASCII=1`), vertical `│` log gutter for dimmed live output, and prominent tool cards with `version before` and `version after`.
 - **Upfront choices, unattended sweep:** Optional cleanup and tap-trust decisions are collected before updates start (or auto-approved with `-a` / `--all`), while firmware flashing stays strictly opt-in via `--firmware`.
-- **Safe, bounded cleanup with reclaimed disk stats:** Distro-aware system package cleanup (`apt`, `dnf`, `pacman`, `apk`) plus explicit bounded workstation cache cleanup (no slow full-`$HOME` crawls!) that measures and reports exact reclaimed disk space (for example, `412 MB`) in the final receipt.
+- **Safe, bounded cleanup with reclaimed disk stats:** Distro-aware system package cleanup (`apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`) plus explicit bounded workstation cache cleanup (no slow full-`$HOME` crawls!) that measures and reports exact reclaimed disk space (for example, `412 MB`) in the final receipt.
 - **Dramatic `RECEIPT` changelog table:** Summarizes every upgraded tool in a Unicode `WHAT CHANGED` table (`PROGRAM / PACKAGE | BEFORE → AFTER | VIA`) with bright cyan before versions, bold amber `→`, and bright mint after versions, followed by `NEEDS YOUR ATTENTION`, compact `NO ACTION NEEDED`, `RUN DETAILS`, `CLEANUP NEXT STEPS`, and `AFTER-RUN CHECK-IN`.
 - **Built-in Safety Coach Mode:** Checks Homebrew tap trust, audits global packages against OpenSSF/OSV (`MAL-*` malicious packages + Critical/High CVEs/GHSAs), inspects non-loopback open listening ports and firewall posture (`ufw` / `firewalld`), and walks you through plain-English guided remedies at the end — never auto-deleting packages or editing firewall rules, even under `--all`.
-- **Modular source + single-file portable build:** Clean `lib/*.sh` modules with `scripts/build-standalone.sh` generating a self-contained `dist/update-all` bundle.
+- **Modular source + single-file portable build:** Clean `lib/*.sh` modules with `scripts/build-standalone.sh` embedding `lib/*.sh` inline into `bin/update-all` to generate a self-contained `dist/update-all` bundle.
 - **Public-safe & secret-redacting:** Redacts common API key, token, private-key, and `PASSWORD=` shapes from streamed logs and runs internal subshells with `BASH_ENV`/`ENV` unset (`bash --noprofile --norc`).
 
 ## Who This Is For
@@ -127,9 +127,9 @@ Missing tools are reported as `SKIP`, never treated as fatal.
 | `rpm-ostree` | Atomic Fedora/Silverblue/Kinoite immutable OS image upgrades |
 | `dnf5` / `dnf` / `yum` | Fedora/RHEL/CentOS/Rocky OS package upgrades and opt-in cleanup |
 | `pacman` | Arch Linux official repo upgrades (non-AUR) and opt-in cache cleanup |
-| `zypper` | openSUSE repository refresh and OS upgrades |
+| `zypper` | openSUSE repository refresh, OS upgrades, and opt-in cache cleanup |
 | `apk` | Alpine Linux index update, upgrades, and opt-in cache cleanup |
-| `xbps` (`xbps-install`) | Void Linux repository sync and OS upgrades |
+| `xbps` (`xbps-install`) | Void Linux repository sync, OS upgrades, and opt-in cleanup |
 | `snap` | Snap application refreshes |
 | `flatpak` | Sandboxed desktop Flatpak app updates |
 | `fwupdmgr` | Linux vendor firmware checks and `FIRMWARE REVIEW` cards (strictly opt-in via `--firmware` or interactive prompt) |
@@ -167,7 +167,7 @@ The `COVERAGE PREFLIGHT` explicitly names areas `update-all` will never touch au
 
 Safety Coach runs automatically at the end of `update-all` (disable with `--no-security-scan` or `UPDATE_ALL_SECURITY_SCAN=0`). It never auto-deletes packages or auto-modifies firewall rules — even when you run `update-all --all`.
 
-1. **OSV.dev Malicious & Advisory Scan (`api.osv.dev/v1/querybatch`):** Audits globally installed `npm`, `uv`, `pipx`, `cargo`, and `brew` packages by sending **only** `(package name, ecosystem, version)` — never credentials, hostnames, or file paths. Flags OpenSSF `MAL-*` malicious packages as `CRITICAL` and Critical/High CVE/GHSA advisories as `HIGH`. If you are offline or the API is unreachable, it skips cleanly without failing the run.
+1. **OSV.dev Malicious & Advisory Scan (`api.osv.dev/v1/querybatch`):** Audits globally installed `npm`, `PyPI` (`uv`/`pipx`), and `crates.io` (`cargo`) packages by sending **only** `(package name, ecosystem, version)` — never credentials, hostnames, or file paths (Homebrew is covered by native `brew tap-info` trust preflight and `brew upgrade`). Flags OpenSSF `MAL-*` malicious packages as `CRITICAL` and Critical/High CVE/GHSA advisories (including CVSS v3.0/v3.1 vector scores) as `CRITICAL`/`HIGH`. If you are offline or the API is unreachable, it skips cleanly without failing the run.
 2. **Open-Port & Firewall Posture Check:** Runs a read-only local socket check (`ss -tulnpH` / `netstat`) and checks `ufw`/`firewalld` status, flagging non-loopback listeners bound to `0.0.0.0`, `::`, or LAN interfaces in plain English.
 3. **Homebrew Tap Trust Preflight:** Inspects third-party taps via cached `brew tap-info` and renders a plain-English `INSIGHT` panel whenever Homebrew reports an `Untrusted` tap.
 4. **Guided Post-Receipt Walkthrough:** When findings exist, prints the `◆ SAFETY COACH — ISSUES FOUND` panel after the receipt and lets you choose per finding: `[1]` run recommended fix, `[2]` run alternate / inspect command, `[3]` skip for now, or `[q]` exit. Under `--non-interactive` or `--dry-run`, it prints the exact commands without executing them.
@@ -176,7 +176,7 @@ Safety Coach runs automatically at the end of `update-all` (disable with `--no-s
 
 Cleanup stays opt-in and split into two explicit choices (both auto-approved only when you pass `-a`/`--all` or answer `y`/`all` upfront):
 
-1. **System package cleanup:** Runs only the detected distro package manager's native cleanup (`apt-get autoremove --purge -y` + `autoclean` + `clean`, `dnf autoremove -y` + `clean packages`, `pacman -Sc --noconfirm`, or `apk cache clean`).
+1. **System package cleanup:** Runs only the detected distro package manager's native cleanup (`apt-get autoremove --purge -y` + `autoclean` + `clean`, `dnf autoremove -y` + `clean packages`, `pacman -Sc --noconfirm`, `zypper --non-interactive clean --all`, `apk cache clean`, or `xbps-remove -Ooy`).
 2. **Bounded workstation cache cleanup:** Targets explicit rebuildable caches only (`npm` / `~/.npm/_npx`, `pip3`, `brew cleanup -s`, bounded `uv cache prune`, known `~/.cache/{camoufox,ms-playwright,BraveSoftware,electron,node-gyp,node,Homebrew,pip}` directories, `~/.codex/.tmp/plugins*`, disabled snap revisions, and `journalctl --vacuum-size=512M`). It **never** crawls all of `$HOME` and never deletes archives, LLM weights, databases, project data, or active virtualenvs. Before/after disk usage is measured and reported as reclaimed space in the final receipt.
 
 ## Configuration

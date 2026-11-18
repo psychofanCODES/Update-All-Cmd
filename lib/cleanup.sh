@@ -156,7 +156,7 @@ cleanup_question() {
       ;;
     xbps)
       _cleanup_print_banner_art "XBPS CLEANUP?" "XBPS" "CLEANUP"
-      printf '%s%bThis will remove orphaned Void packages and obsolete cached archives (xbps-remove -Oo).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
+      printf '%s%bThis will remove orphaned Void packages and obsolete cached archives (xbps-remove -Ooy).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
       printf '%s%bNothing outside xbps is deleted here.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
       ;;
     *)
@@ -338,11 +338,11 @@ run_system_pkg_cleanup() {
       ;;
     xbps)
       if [ "${UPDATE_ALL_DRY_RUN:-0}" = 1 ]; then
-        show_cmd sudo xbps-remove -Oo
+        show_cmd sudo xbps-remove -Ooy
         return 0
       fi
       before_kb="$(dir_size_kb /var/cache/xbps)"
-      sudo_cmd xbps-remove -Oo || code_a=$?
+      sudo_cmd xbps-remove -Ooy || code_a=$?
       after_kb="$(dir_size_kb /var/cache/xbps)"
       if [ "$before_kb" -gt "$after_kb" ]; then
         reclaimed=$((before_kb - after_kb))

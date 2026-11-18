@@ -3389,12 +3389,13 @@ run_updates() {
       show_brew_tap_trust_preflight || true
     fi
     show_pending_brew_updates
-    local brew_output="" brew_code=0
+    local brew_output="" brew_code=0 delta_count_before=0
     run_shell_capture brew_output 'HOMEBREW_NO_ENV_HINTS=1 brew update && HOMEBREW_NO_ENV_HINTS=1 brew upgrade'
     brew_code=$?
+    delta_count_before="${#_ua_delta_pkgs[@]}"
     extract_brew_deltas "$brew_output"
     after="$(version_of brew 2>/dev/null || true)"
-    if printf '%s\n' "$brew_output" | output_implies_update; then
+    if printf '%s\n' "$brew_output" | output_implies_update || [ "${#_ua_delta_pkgs[@]}" -gt "$delta_count_before" ]; then
       local brew_delta="" brew_name="" brew_old="" brew_new=""
       brew_delta="$(printf '%s\n' "$brew_output" | first_arrow_delta)"
       if [ -n "$brew_delta" ]; then
@@ -3710,7 +3711,7 @@ cleanup_question() {
       ;;
     xbps)
       _cleanup_print_banner_art "XBPS CLEANUP?" "XBPS" "CLEANUP"
-      printf '%s%bThis will remove orphaned Void packages and obsolete cached archives (xbps-remove -Oo).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
+      printf '%s%bThis will remove orphaned Void packages and obsolete cached archives (xbps-remove -Ooy).%b\n' "$indent" "${C_PURPOSE:-}" "${C_RESET:-}"
       printf '%s%bNothing outside xbps is deleted here.%b\n\n' "$indent" "${C_TIP:-}" "${C_RESET:-}"
       ;;
     *)
@@ -3892,11 +3893,11 @@ run_system_pkg_cleanup() {
       ;;
     xbps)
       if [ "${UPDATE_ALL_DRY_RUN:-0}" = 1 ]; then
-        show_cmd sudo xbps-remove -Oo
+        show_cmd sudo xbps-remove -Ooy
         return 0
       fi
       before_kb="$(dir_size_kb /var/cache/xbps)"
-      sudo_cmd xbps-remove -Oo || code_a=$?
+      sudo_cmd xbps-remove -Ooy || code_a=$?
       after_kb="$(dir_size_kb /var/cache/xbps)"
       if [ "$before_kb" -gt "$after_kb" ]; then
         reclaimed=$((before_kb - after_kb))
@@ -4345,7 +4346,7 @@ show_brew_tap_trust_preflight() {
             "In a live run, answer yes only if you do not recognize or use this tap; Homebrew may refuse if installed tools still depend on it."
         else
           printf '%bRUN%b upfront choice was yes: untapping %s before brew update.\n' "${C_OK:-}" "${C_RESET:-}" "$tap"
-          if HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew untap "$tap"; then
+          if run_cmd env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew untap "$tap"; then
             add_concern "Trust source removed" \
               "Homebrew no longer reads package definitions from $tap." \
               "Nothing else is needed unless you later discover a tool expected that tap; then install from a trusted source."
@@ -4466,7 +4467,7 @@ _safety_osv_query_cmd() {
 }
 
 _safety_collect_osv_tuples() {
-  local line pkg ver raw
+  local pkg ver raw
   _ua_osv_eco=()
   _ua_osv_mgr=()
   _ua_osv_pkg=()
@@ -4503,36 +4504,83 @@ _safety_collect_osv_tuples() {
       _ua_osv_eco+=("crates.io"); _ua_osv_mgr+=("cargo"); _ua_osv_pkg+=("$pkg"); _ua_osv_ver+=("$ver")
     done <<< "$raw"
   fi
-
-  if command -v brew >/dev/null 2>&1; then
-    raw="$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 _safety_osv_query_cmd brew list --versions)"
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      pkg="${line%% *}"
-      ver="${line##* }"
-      [ -n "$pkg" ] && [ -n "$ver" ] && [ "$pkg" != "$ver" ] || continue
-      _ua_osv_eco+=("Homebrew"); _ua_osv_mgr+=("brew"); _ua_osv_pkg+=("$pkg"); _ua_osv_ver+=("$ver")
-    done <<< "$raw"
-  fi
 }
 
 _safety_parse_osv_batch() {
   local json_text="$1"
   if command -v python3 >/dev/null 2>&1; then
     printf '%s' "$json_text" | python3 -c '
-import json, sys
+import json, math, sys
+
+def cvss_roundup(val):
+    int_input = round(val * 100000)
+    if (int_input % 10000) == 0:
+        return int_input / 100000.0
+    return (math.floor(int_input / 10000) + 1) / 10.0
+
+def cvss_v3_score(vector):
+    if not isinstance(vector, str):
+        return None
+    s = vector.strip().upper()
+    if not (s.startswith("CVSS:3.0/") or s.startswith("CVSS:3.1/")):
+        return None
+    metrics = {}
+    for part in s.split("/")[1:]:
+        if ":" in part:
+            k, v = part.split(":", 1)
+            metrics[k] = v
+    scope = metrics.get("S")
+    if scope not in ("U", "C"):
+        return None
+    av_map = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}
+    ac_map = {"L": 0.77, "H": 0.44}
+    pr_map = {"N": 0.85, "L": 0.62, "H": 0.27} if scope == "U" else {"N": 0.85, "L": 0.68, "H": 0.50}
+    ui_map = {"N": 0.85, "R": 0.62}
+    impact_map = {"H": 0.56, "L": 0.22, "N": 0.0}
+    try:
+        av = av_map[metrics["AV"]]
+        ac = ac_map[metrics["AC"]]
+        pr = pr_map[metrics["PR"]]
+        ui = ui_map[metrics["UI"]]
+        c = impact_map[metrics["C"]]
+        i = impact_map[metrics["I"]]
+        a = impact_map[metrics["A"]]
+    except KeyError:
+        return None
+    impact_sub = 1.0 - ((1.0 - c) * (1.0 - i) * (1.0 - a))
+    if scope == "U":
+        impact = 6.42 * impact_sub
+    else:
+        impact = 7.52 * (impact_sub - 0.029) - 3.25 * ((impact_sub - 0.02) ** 15)
+    if impact <= 0.0:
+        return 0.0
+    exploitability = 8.22 * av * ac * pr * ui
+    raw = (impact + exploitability) if scope == "U" else (1.08 * (impact + exploitability))
+    return cvss_roundup(min(raw, 10.0))
 
 def cvss_to_sev(score):
-    try:
+    if isinstance(score, bool):
+        return ""
+    val = None
+    if isinstance(score, (int, float)):
         val = float(score)
-    except (TypeError, ValueError):
+    elif isinstance(score, str):
+        st = score.strip()
+        if st.upper().startswith(("CVSS:3.0/", "CVSS:3.1/")):
+            val = cvss_v3_score(st)
+        else:
+            try:
+                val = float(st)
+            except (TypeError, ValueError):
+                val = None
+    if val is None:
         return ""
     if val >= 9.0:
         return "CRITICAL"
     if val >= 7.0:
         return "HIGH"
     if val >= 4.0:
-        return "MODERATE"
+        return "MEDIUM"
     if val > 0.0:
         return "LOW"
     return ""
@@ -4599,19 +4647,54 @@ for idx, entry in enumerate(results):
   fi
 
   if command -v jq >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # jq variables and string interpolation are intentional
     printf '%s' "$json_text" | jq -r '
       def norm_sev:
         if type == "string" then ascii_upcase | gsub("^\\s+|\\s+$"; "") else "" end;
+      def pow15:
+        . as $x | ($x * $x) as $x2 | ($x2 * $x2) as $x4 | ($x4 * $x4) as $x8 | ($x8 * $x4 * $x2 * $x);
+      def cvss_roundup:
+        ((. * 100000 + 0.5) | floor) as $i |
+        if ($i - (($i / 10000 | floor) * 10000)) == 0 then ($i / 100000)
+        else ((($i / 10000) | floor) + 1) / 10 end;
+      def cvss_v3_num($vec):
+        ($vec | ascii_upcase | split("/")[1:] | reduce .[] as $p ({}; ($p | split(":")) as $kv | if ($kv | length) >= 2 then .[$kv[0]] = $kv[1] else . end)) as $m |
+        ($m.S // "") as $s |
+        if ($s != "U" and $s != "C") then empty
+        else
+          ({"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}[$m.AV // ""]) as $av |
+          ({"L": 0.77, "H": 0.44}[$m.AC // ""]) as $ac |
+          ((if $s == "U" then {"N": 0.85, "L": 0.62, "H": 0.27} else {"N": 0.85, "L": 0.68, "H": 0.50} end)[$m.PR // ""]) as $pr |
+          ({"N": 0.85, "R": 0.62}[$m.UI // ""]) as $ui |
+          ({"H": 0.56, "L": 0.22, "N": 0.0}[$m.C // ""]) as $c |
+          ({"H": 0.56, "L": 0.22, "N": 0.0}[$m.I // ""]) as $ci |
+          ({"H": 0.56, "L": 0.22, "N": 0.0}[$m.A // ""]) as $ca |
+          if ($av == null or $ac == null or $pr == null or $ui == null or $c == null or $ci == null or $ca == null) then empty
+          else
+            (1.0 - ((1.0 - $c) * (1.0 - $ci) * (1.0 - $ca))) as $impact_sub |
+            (if $s == "U" then (6.42 * $impact_sub) else (7.52 * ($impact_sub - 0.029) - 3.25 * (($impact_sub - 0.02) | pow15)) end) as $imp |
+            if $imp <= 0 then 0.0
+            else
+              (8.22 * $av * $ac * $pr * $ui) as $exp |
+              (if $s == "U" then ($imp + $exp) else (1.08 * ($imp + $exp)) end) as $raw |
+              ((if $raw > 10.0 then 10.0 else $raw end) | cvss_roundup)
+            end
+          end
+        end;
       def cvss_num($val):
         if ($val | type) == "number" then $val
-        elif ($val | type) == "string" and ($val | test("^[0-9]+(\\.[0-9]+)?$")) then ($val | tonumber)
+        elif ($val | type) == "string" then
+          ($val | gsub("^\\s+|\\s+$"; "")) as $t |
+          if ($t | test("^[0-9]+(\\.[0-9]+)?$")) then ($t | tonumber)
+          elif ($t | ascii_upcase | test("^CVSS:3\\.[01]/")) then cvss_v3_num($t)
+          else empty end
         else empty end;
       def cvss_sev($arr; $db_score):
         ([($arr[]? | cvss_num(.score?)), cvss_num($db_score)] | max) as $m |
         if $m == null then ""
         elif $m >= 9.0 then "CRITICAL"
         elif $m >= 7.0 then "HIGH"
-        elif $m >= 4.0 then "MODERATE"
+        elif $m >= 4.0 then "MEDIUM"
         elif $m > 0 then "LOW"
         else "" end;
       def extract_sev($v):
@@ -4642,19 +4725,77 @@ _safety_parse_osv_vuln() {
   local json_text="$1"
   if command -v python3 >/dev/null 2>&1; then
     printf '%s' "$json_text" | python3 -c '
-import json, sys
+import json, math, sys
+
+def cvss_roundup(val):
+    int_input = round(val * 100000)
+    if (int_input % 10000) == 0:
+        return int_input / 100000.0
+    return (math.floor(int_input / 10000) + 1) / 10.0
+
+def cvss_v3_score(vector):
+    if not isinstance(vector, str):
+        return None
+    s = vector.strip().upper()
+    if not (s.startswith("CVSS:3.0/") or s.startswith("CVSS:3.1/")):
+        return None
+    metrics = {}
+    for part in s.split("/")[1:]:
+        if ":" in part:
+            k, v = part.split(":", 1)
+            metrics[k] = v
+    scope = metrics.get("S")
+    if scope not in ("U", "C"):
+        return None
+    av_map = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}
+    ac_map = {"L": 0.77, "H": 0.44}
+    pr_map = {"N": 0.85, "L": 0.62, "H": 0.27} if scope == "U" else {"N": 0.85, "L": 0.68, "H": 0.50}
+    ui_map = {"N": 0.85, "R": 0.62}
+    impact_map = {"H": 0.56, "L": 0.22, "N": 0.0}
+    try:
+        av = av_map[metrics["AV"]]
+        ac = ac_map[metrics["AC"]]
+        pr = pr_map[metrics["PR"]]
+        ui = ui_map[metrics["UI"]]
+        c = impact_map[metrics["C"]]
+        i = impact_map[metrics["I"]]
+        a = impact_map[metrics["A"]]
+    except KeyError:
+        return None
+    impact_sub = 1.0 - ((1.0 - c) * (1.0 - i) * (1.0 - a))
+    if scope == "U":
+        impact = 6.42 * impact_sub
+    else:
+        impact = 7.52 * (impact_sub - 0.029) - 3.25 * ((impact_sub - 0.02) ** 15)
+    if impact <= 0.0:
+        return 0.0
+    exploitability = 8.22 * av * ac * pr * ui
+    raw = (impact + exploitability) if scope == "U" else (1.08 * (impact + exploitability))
+    return cvss_roundup(min(raw, 10.0))
 
 def cvss_to_sev(score):
-    try:
+    if isinstance(score, bool):
+        return ""
+    val = None
+    if isinstance(score, (int, float)):
         val = float(score)
-    except (TypeError, ValueError):
+    elif isinstance(score, str):
+        st = score.strip()
+        if st.upper().startswith(("CVSS:3.0/", "CVSS:3.1/")):
+            val = cvss_v3_score(st)
+        else:
+            try:
+                val = float(st)
+            except (TypeError, ValueError):
+                val = None
+    if val is None:
         return ""
     if val >= 9.0:
         return "CRITICAL"
     if val >= 7.0:
         return "HIGH"
     if val >= 4.0:
-        return "MODERATE"
+        return "MEDIUM"
     if val > 0.0:
         return "LOW"
     return ""
@@ -4710,19 +4851,54 @@ print(f"{sev}|{aff_pkg}|{aff_eco}|{summary}")
   fi
 
   if command -v jq >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # jq variables and string interpolation are intentional
     printf '%s' "$json_text" | jq -r '
       def norm_sev:
         if type == "string" then ascii_upcase | gsub("^\\s+|\\s+$"; "") else "" end;
+      def pow15:
+        . as $x | ($x * $x) as $x2 | ($x2 * $x2) as $x4 | ($x4 * $x4) as $x8 | ($x8 * $x4 * $x2 * $x);
+      def cvss_roundup:
+        ((. * 100000 + 0.5) | floor) as $i |
+        if ($i - (($i / 10000 | floor) * 10000)) == 0 then ($i / 100000)
+        else ((($i / 10000) | floor) + 1) / 10 end;
+      def cvss_v3_num($vec):
+        ($vec | ascii_upcase | split("/")[1:] | reduce .[] as $p ({}; ($p | split(":")) as $kv | if ($kv | length) >= 2 then .[$kv[0]] = $kv[1] else . end)) as $m |
+        ($m.S // "") as $s |
+        if ($s != "U" and $s != "C") then empty
+        else
+          ({"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}[$m.AV // ""]) as $av |
+          ({"L": 0.77, "H": 0.44}[$m.AC // ""]) as $ac |
+          ((if $s == "U" then {"N": 0.85, "L": 0.62, "H": 0.27} else {"N": 0.85, "L": 0.68, "H": 0.50} end)[$m.PR // ""]) as $pr |
+          ({"N": 0.85, "R": 0.62}[$m.UI // ""]) as $ui |
+          ({"H": 0.56, "L": 0.22, "N": 0.0}[$m.C // ""]) as $c |
+          ({"H": 0.56, "L": 0.22, "N": 0.0}[$m.I // ""]) as $ci |
+          ({"H": 0.56, "L": 0.22, "N": 0.0}[$m.A // ""]) as $ca |
+          if ($av == null or $ac == null or $pr == null or $ui == null or $c == null or $ci == null or $ca == null) then empty
+          else
+            (1.0 - ((1.0 - $c) * (1.0 - $ci) * (1.0 - $ca))) as $impact_sub |
+            (if $s == "U" then (6.42 * $impact_sub) else (7.52 * ($impact_sub - 0.029) - 3.25 * (($impact_sub - 0.02) | pow15)) end) as $imp |
+            if $imp <= 0 then 0.0
+            else
+              (8.22 * $av * $ac * $pr * $ui) as $exp |
+              (if $s == "U" then ($imp + $exp) else (1.08 * ($imp + $exp)) end) as $raw |
+              ((if $raw > 10.0 then 10.0 else $raw end) | cvss_roundup)
+            end
+          end
+        end;
       def cvss_num($val):
         if ($val | type) == "number" then $val
-        elif ($val | type) == "string" and ($val | test("^[0-9]+(\\.[0-9]+)?$")) then ($val | tonumber)
+        elif ($val | type) == "string" then
+          ($val | gsub("^\\s+|\\s+$"; "")) as $t |
+          if ($t | test("^[0-9]+(\\.[0-9]+)?$")) then ($t | tonumber)
+          elif ($t | ascii_upcase | test("^CVSS:3\\.[01]/")) then cvss_v3_num($t)
+          else empty end
         else empty end;
       def cvss_sev($arr; $db_score):
         ([($arr[]? | cvss_num(.score?)), cvss_num($db_score)] | max) as $m |
         if $m == null then ""
         elif $m >= 9.0 then "CRITICAL"
         elif $m >= 7.0 then "HIGH"
-        elif $m >= 4.0 then "MODERATE"
+        elif $m >= 4.0 then "MEDIUM"
         elif $m > 0 then "LOW"
         else "" end;
       ((.database_specific.severity? // "" | norm_sev) as $s1 |
@@ -5114,29 +5290,32 @@ run_safety_coach_scan() {
   fi
 
   if command -v brew >/dev/null 2>&1 && [ "${_ua_brew_preflight_shown:-0}" != 1 ]; then
+    _ua_last_status="OK"
     if declare -F tui_step_begin >/dev/null 2>&1; then
       tui_step_begin "safety-brew" "brew tap trust"
     fi
     show_brew_tap_trust_preflight
     if declare -F tui_step_end >/dev/null 2>&1; then
-      tui_step_end "safety-brew" "OK"
+      tui_step_end "safety-brew" "${_ua_last_status:-OK}"
     fi
   fi
 
+  _ua_last_status="OK"
   if declare -F tui_step_begin >/dev/null 2>&1; then
     tui_step_begin "safety-osv" "safety coach: OSV package scan"
   fi
   scan_osv_packages
   if declare -F tui_step_end >/dev/null 2>&1; then
-    tui_step_end "safety-osv" "OK"
+    tui_step_end "safety-osv" "${_ua_last_status:-OK}"
   fi
 
+  _ua_last_status="OK"
   if declare -F tui_step_begin >/dev/null 2>&1; then
     tui_step_begin "safety-ports" "safety coach: open ports"
   fi
   scan_public_ports
   if declare -F tui_step_end >/dev/null 2>&1; then
-    tui_step_end "safety-ports" "OK"
+    tui_step_end "safety-ports" "${_ua_last_status:-OK}"
   fi
 }
 
@@ -5690,7 +5869,7 @@ cleanup_status_for() {
   if [ "$label" = "apt autoremove" ]; then
     for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
       case "${_ua_labels[$i]}" in
-        "dnf autoremove"|"pacman cache clean"|"apk cache clean")
+        "dnf5 autoremove"|"dnf autoremove"|"yum autoremove"|"pacman cache clean"|"zypper cleanup"|"apk cache clean"|"xbps cleanup"|"system package cleanup")
           printf '%s' "${_ua_stats[$i]}"
           return 0
           ;;
@@ -5711,7 +5890,7 @@ cleanup_note_for() {
   if [ "$label" = "apt autoremove" ]; then
     for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
       case "${_ua_labels[$i]}" in
-        "dnf autoremove"|"pacman cache clean"|"apk cache clean")
+        "dnf5 autoremove"|"dnf autoremove"|"yum autoremove"|"pacman cache clean"|"zypper cleanup"|"apk cache clean"|"xbps cleanup"|"system package cleanup")
           printf '%s' "${_ua_notes[$i]}"
           return 0
           ;;

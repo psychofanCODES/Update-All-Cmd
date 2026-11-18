@@ -397,6 +397,20 @@ make_mock "$alpine_bin" sudo <<'EOF'
 "$@"
 EOF
 
+void_bin="$tmpdir/void-bin"
+make_mock "$void_bin" xbps-install <<'EOF'
+#!/usr/bin/env bash
+echo "XBPS: 0.59.2"
+EOF
+make_mock "$void_bin" xbps-remove <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+make_mock "$void_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+"$@"
+EOF
+
 make_mock "$brew_only_bin" brew <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -440,6 +454,9 @@ run_bg arch-dry env HOME="$fake_home" PATH="$arch_bin:$posix_bin" \
   "$UPDATE_ALL" --dry-run --no-anim --no-color
 
 run_bg alpine-dry env HOME="$fake_home" PATH="$alpine_bin:$posix_bin" \
+  "$UPDATE_ALL" --dry-run --no-anim --no-color
+
+run_bg void-dry env HOME="$fake_home" PATH="$void_bin:$posix_bin" \
   "$UPDATE_ALL" --dry-run --no-anim --no-color
 
 run_bg brew-only-dry env HOME="$fake_home" PATH="$brew_only_bin:$posix_bin" \
@@ -970,6 +987,120 @@ fw_ports_out="$(
 assert_contains "$fw_ports_out" "sudo firewall-cmd --permanent --remove-port=3000/tcp && sudo firewall-cmd --reload" "firewalld host without ufw must show firewall-cmd remedy"
 assert_contains "$fw_ports_out" "firewalld (running)" "firewalld host must report firewalld posture"
 
+# --- Suite 11d (Gate B): CVSS v3.1 vector scoring (python3 + jq) & Homebrew excluded from OSV tuples ---
+cvss_tuples_mock="$tmpdir/cvss-tuples.txt"
+cat > "$cvss_tuples_mock" <<'EOF'
+npm|npm|exec-vector-pkg|1.0.0
+npm|npm|xss-medium-pkg|2.0.0
+EOF
+
+cvss_batch_mock="$tmpdir/cvss-batch.json"
+cat > "$cvss_batch_mock" <<'EOF'
+{
+  "results": [
+    {
+      "vulns": [
+        {
+          "id": "GHSA-cvss-9800-critical",
+          "summary": "Remote code execution scored only via CVSS 3.1 vector",
+          "severity": [
+            {
+              "type": "CVSS_V3",
+              "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "vulns": [
+        {
+          "id": "GHSA-cvss-6100-medium",
+          "summary": "Medium XSS scored only via CVSS 3.1 vector",
+          "severity": [
+            {
+              "type": "CVSS_V3",
+              "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+EOF
+
+cvss_out="$(
+  HOME="$fake_home" PATH="$posix_bin" \
+  UPDATE_ALL_SAFETY_SELFTEST=osv \
+  UPDATE_ALL_OSV_MOCK_FILE="$cvss_batch_mock" \
+  UPDATE_ALL_OSV_TUPLES_MOCK_FILE="$cvss_tuples_mock" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
+)"
+assert_contains "$cvss_out" "CRITICAL · ADVISORY" "CVSS:3.1 9.8 vector without database_specific.severity must classify as CRITICAL"
+assert_contains "$cvss_out" "GHSA-cvss-9800-critical" "CVSS:3.1 CRITICAL advisory ID must be reported"
+assert_contains "$cvss_out" "exec-vector-pkg@1.0.0 (npm)" "CVSS:3.1 CRITICAL advisory must attribute to exec-vector-pkg"
+assert_not_contains "$cvss_out" "GHSA-cvss-6100-medium" "CVSS:3.1 MEDIUM (6.1) vector must be filtered out"
+assert_not_contains "$cvss_out" "xss-medium-pkg" "CVSS:3.1 MEDIUM package must not appear in findings"
+
+if command -v jq >/dev/null 2>&1; then
+  jq_only_bin="$tmpdir/jq-only-bin"
+  mkdir -p -- "$jq_only_bin"
+  for _u in bash sh env awk sed grep tr cut cat head tail wc sort uniq fold mktemp mkdir rm mv cp chmod date uname id readlink dirname basename sleep kill true false printf test '[' ls stat touch which; do
+    if [ -e "$posix_bin/$_u" ]; then
+      ln -sf "$posix_bin/$_u" "$jq_only_bin/$_u"
+    fi
+  done
+  ln -sf "$(command -v jq)" "$jq_only_bin/jq"
+
+  jq_batch_parsed="$(
+    # shellcheck disable=SC2016 # Positional parameters are intentionally expanded inside the inner bash -c shell.
+    PATH="$jq_only_bin" bash --noprofile --norc -c '
+      source "$1"
+      _safety_parse_osv_batch "$(cat "$2")"
+    ' _ "$ROOT_DIR/lib/safety_coach.sh" "$cvss_batch_mock"
+  )"
+  assert_contains "$jq_batch_parsed" "0|GHSA-cvss-9800-critical|CRITICAL|0|" "jq fallback batch parser must score CVSS:3.1 9.8 vector as CRITICAL"
+  assert_contains "$jq_batch_parsed" "1|GHSA-cvss-6100-medium|MEDIUM|0|" "jq fallback batch parser must score CVSS:3.1 6.1 vector as MEDIUM"
+
+  cvss_vuln_mock="$tmpdir/cvss-vuln.json"
+  printf '%s\n' '{"id":"GHSA-cvss-9800-critical","summary":"Hydrated CVSS 3.1 vector","severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}' > "$cvss_vuln_mock"
+  jq_vuln_parsed="$(
+    # shellcheck disable=SC2016 # Positional parameters are intentionally expanded inside the inner bash -c shell.
+    PATH="$jq_only_bin" bash --noprofile --norc -c '
+      source "$1"
+      _safety_parse_osv_vuln "$(cat "$2")"
+    ' _ "$ROOT_DIR/lib/safety_coach.sh" "$cvss_vuln_mock"
+  )"
+  assert_contains "$jq_vuln_parsed" "CRITICAL|||" "jq fallback vuln parser must score CVSS:3.1 9.8 vector as CRITICAL"
+fi
+
+osv_no_brew_bin="$tmpdir/osv-no-brew-bin"
+make_mock "$osv_no_brew_bin" brew <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "list" ]; then
+  printf 'formula-only 1.2.3\n'
+fi
+exit 0
+EOF
+make_mock "$osv_no_brew_bin" npm <<'EOF'
+#!/usr/bin/env bash
+printf '/usr/local/lib\n`-- demo-npm-pkg@2.4.0\n'
+EOF
+osv_tuples_collected="$(
+  # shellcheck disable=SC2016 # Positional parameters and arrays are intentionally expanded inside the inner bash -c shell.
+  PATH="$osv_no_brew_bin:$posix_bin" bash --noprofile --norc -c '
+    source "$1"
+    _safety_collect_osv_tuples
+    for ((i = 0; i < ${#_ua_osv_pkg[@]}; i++)); do
+      printf "%s|%s|%s|%s\n" "${_ua_osv_eco[$i]}" "${_ua_osv_mgr[$i]}" "${_ua_osv_pkg[$i]}" "${_ua_osv_ver[$i]}"
+    done
+  ' _ "$ROOT_DIR/lib/safety_coach.sh"
+)"
+assert_contains "$osv_tuples_collected" "npm|npm|demo-npm-pkg|2.4.0" "OSV tuple collector must emit npm packages"
+assert_not_contains "$osv_tuples_collected" "Homebrew" "OSV tuple collector must NEVER emit Homebrew ecosystem"
+assert_not_contains "$osv_tuples_collected" "formula-only" "OSV tuple collector must NEVER emit brew formulae"
+
 # ===========================================================================
 # Wait for all parallel dry-run / live-mock / dist jobs, then assert results
 # ===========================================================================
@@ -1142,6 +1273,34 @@ assert_contains "$alpine_out" "apk upgrade" "Alpine dry-run must preview apk upg
 assert_contains "$alpine_out" "APK CACHE CLEANUP?" "Alpine dry-run must show APK CACHE CLEANUP?"
 assert_not_contains "$alpine_out" "$ sudo env DEBIAN_FRONTEND=noninteractive" "Alpine dry-run must never invoke apt-get"
 
+void_out="$(read_out void-dry)"
+assert_eq "$(read_rc void-dry)" "0" "Void (xbps) dry-run must exit 0"
+assert_contains "$void_out" "pkg manager: xbps" "Void dry-run must detect xbps"
+assert_contains "$void_out" "XBPS CLEANUP?" "Void dry-run must show XBPS CLEANUP?"
+assert_contains "$void_out" "sudo xbps-remove -Ooy" "Void cleanup dry-run must use non-interactive xbps-remove -Ooy"
+assert_not_contains "$void_out" "xbps-remove -Oo)" "Void cleanup prompt must not omit -y flag on xbps-remove -Ooy"
+assert_not_contains "$void_out" "$ sudo env DEBIAN_FRONTEND=noninteractive" "Void dry-run must never invoke apt-get"
+
+# Gate B regression: cleanup_status_for / cleanup_note_for must not mask dnf5/zypper/xbps FAIL as SKIP
+for _cl_case in \
+  "dnf5 autoremove|dnf5 autoremove failed" \
+  "zypper cleanup|zypper clean failed" \
+  "xbps cleanup|xbps-remove failed"; do
+  _cl_label="${_cl_case%%|*}"
+  _cl_note="${_cl_case#*|}"
+  _cl_res="$(
+    # shellcheck disable=SC2016 # Positional parameters are intentionally expanded inside the inner bash -c shell.
+    bash --noprofile --norc -c '
+      source "$1"
+      _ua_labels=("$2")
+      _ua_stats=("FAIL")
+      _ua_notes=("$3")
+      printf "%s|%s\n" "$(cleanup_status_for "apt autoremove")" "$(cleanup_note_for "apt autoremove")"
+    ' _ "$ROOT_DIR/lib/receipt.sh" "$_cl_label" "$_cl_note"
+  )"
+  assert_eq "$_cl_res" "FAIL|$_cl_note" "cleanup_status_for/note_for must surface FAIL for $_cl_label instead of masking as SKIP"
+done
+
 brew_only_out="$(read_out brew-only-dry)"
 assert_eq "$(read_rc brew-only-dry)" "0" "brew-only dry-run must exit 0"
 assert_contains "$brew_only_out" "pkg manager: none" "brew-only dry-run must detect pkg manager: none"
@@ -1204,6 +1363,11 @@ if [ -x "$DIST_BUNDLE" ]; then
   else
     fail "dist/update-all does not match scripts/build-standalone.sh output (rebuild needed)"
   fi
+
+  dist_mode="$(stat -c '%a' "$DIST_BUNDLE" 2>/dev/null || stat -f '%Lp' "$DIST_BUNDLE" 2>/dev/null || true)"
+  assert_eq "$dist_mode" "755" "dist/update-all must have 0755 permissions (world-readable executable, not 711)"
+  dist_ls_perms="$(ls -l "$DIST_BUNDLE" | awk '{print substr($1, 1, 10)}')"
+  assert_eq "$dist_ls_perms" "-rwxr-xr-x" "dist/update-all permissions string must be -rwxr-xr-x"
 
   dist_visual="$(read_out dist-visual)"
   assert_eq "$(read_rc dist-visual)" "0" "dist/update-all visual receipt selftest must exit 0"
