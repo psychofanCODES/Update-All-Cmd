@@ -1,220 +1,242 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Comprehensive TDD & UX contract test suite for update-all.
+# Strictly Bash 3.2+ parse-compatible and ShellCheck-clean; runs in <15s on macOS & Ubuntu.
+set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPDATE_ALL="$ROOT_DIR/bin/update-all"
+DIST_BUNDLE="$ROOT_DIR/dist/update-all"
 
-fail() {
-  printf 'FAIL: %s\n' "$1" >&2
-  exit 1
+PASS_COUNT=0
+FAIL_COUNT=0
+START_S="$(date +%s)"
+
+pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
 }
 
-output="$("$UPDATE_ALL" --dry-run --no-anim --no-color)"
+fail() {
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  printf 'FAIL: %s\n' "$1" >&2
+}
 
-printf '%s\n' "$output" | grep -F "OPENAI CODEX CLI" >/dev/null \
-  || fail "expected prominent uppercase unit title for Codex"
+assert_contains() {
+  local haystack="$1" needle="$2" msg="$3"
+  if printf '%s\n' "$haystack" | grep -F -- "$needle" >/dev/null; then
+    pass
+  else
+    fail "$msg (missing: $needle)"
+  fi
+}
 
-printf '%s\n' "$output" | grep -F "claude update" >/dev/null \
-  || fail "expected Claude Code to use its first-party updater"
+assert_not_contains() {
+  local haystack="$1" needle="$2" msg="$3"
+  if printf '%s\n' "$haystack" | grep -F -- "$needle" >/dev/null; then
+    fail "$msg (unexpected: $needle)"
+  else
+    pass
+  fi
+}
 
-printf '%s\n' "$output" | grep -F "codex update" >/dev/null \
-  || fail "expected Codex CLI to use its first-party updater"
+assert_regex() {
+  local haystack="$1" pattern="$2" msg="$3"
+  if printf '%s\n' "$haystack" | grep -E -- "$pattern" >/dev/null; then
+    pass
+  else
+    fail "$msg (pattern not matched: $pattern)"
+  fi
+}
 
-if printf '%s\n' "$output" | grep -F "npm install -g @anthropic-ai/claude-code@latest" >/dev/null; then
-  fail "Claude Code should not be updated through npm install"
-fi
+assert_not_regex() {
+  local haystack="$1" pattern="$2" msg="$3"
+  if printf '%s\n' "$haystack" | grep -E -- "$pattern" >/dev/null; then
+    fail "$msg (unexpected pattern: $pattern)"
+  else
+    pass
+  fi
+}
 
-if printf '%s\n' "$output" | grep -F "npm install -g @openai/codex@latest" >/dev/null; then
-  fail "Codex CLI should not be updated through npm install"
-fi
+assert_eq() {
+  local actual="$1" expected="$2" msg="$3"
+  if [ "$actual" = "$expected" ]; then
+    pass
+  else
+    fail "$msg (expected '$expected', got '$actual')"
+  fi
+}
 
-printf '%s\n' "$output" | grep -F "version before" >/dev/null \
-  || fail "expected readable version before row"
+assert_file_not_exists() {
+  local target="$1" msg="$2"
+  if [ -e "$target" ]; then
+    fail "$msg (unexpected file exists: $target)"
+  else
+    pass
+  fi
+}
 
-printf '%s\n' "$output" | grep -F "after" >/dev/null \
-  || fail "expected readable stacked version outcome rows"
+assert_file_contains() {
+  local target="$1" needle="$2" msg="$3"
+  if [ -r "$target" ] && grep -F -- "$needle" "$target" >/dev/null; then
+    pass
+  else
+    fail "$msg (missing '$needle' in $target)"
+  fi
+}
 
-printf '%s\n' "$output" | grep -F "path" >/dev/null \
-  || fail "expected executable path rows when version output includes a path"
+# Portable PTY runner (works identically on macOS BSD and Ubuntu Linux).
+run_in_pty() {
+  local pty_input="$1" pty_cmd="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$pty_input" "$pty_cmd" <<'PY'
+import os, pty, select, subprocess, sys, time
 
-if printf '%s\n' "$output" | grep -F "version = " >/dev/null; then
-  fail "version rows should show the version value directly, without noisy prefixes"
-fi
+inp = sys.argv[1].encode("utf-8")
+cmd = sys.argv[2]
+master, slave = pty.openpty()
+proc = subprocess.Popen(
+    ["/bin/bash", "-c", cmd],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    close_fds=True,
+)
+os.close(slave)
 
-if printf '%s\n' "$output" | grep -F "VERSION BEFORE" >/dev/null; then
-  fail "version labels should not be shouty uppercase"
-fi
+sent = False
+out = bytearray()
+deadline = time.time() + 12.0
+while time.time() < deadline:
+    if inp and not sent and len(out) > 0:
+        try:
+            os.write(master, inp)
+            sent = True
+        except OSError:
+            pass
+    r, _, _ = select.select([master], [], [], 0.08)
+    if r:
+        try:
+            chunk = os.read(master, 4096)
+            if not chunk:
+                break
+            out.extend(chunk)
+        except OSError:
+            break
+    elif proc.poll() is not None:
+        break
 
-printf '%s\n' "$output" | grep -F "purpose" >/dev/null \
-  || fail "expected purpose label instead of does"
+if inp and not sent:
+    try:
+        os.write(master, inp)
+    except OSError:
+        pass
+    time.sleep(0.1)
+    while True:
+        r, _, _ = select.select([master], [], [], 0.05)
+        if not r:
+            break
+        try:
+            chunk = os.read(master, 4096)
+            if not chunk:
+                break
+            out.extend(chunk)
+        except OSError:
+            break
 
-if printf '%s\n' "$output" | grep -F "does" >/dev/null; then
-  fail "legacy does label should not be present"
-fi
+try:
+    proc.wait(timeout=3)
+except Exception:
+    proc.kill()
+os.close(master)
+sys.stdout.buffer.write(out)
+PY
+    return $?
+  fi
 
-printf '%s\n' "$output" | grep -F "FLATPAK APPS" >/dev/null \
-  || fail "expected missing tools to still show public-safe package cards"
-
-printf '%s\n' "$output" | grep -F "result" >/dev/null \
-  || fail "expected result rows for skipped tools"
-
-if printf '%s\n' "$output" | grep -F "mode" >/dev/null; then
-  fail "intro should not contain the old mode metadata line"
-fi
-
-if printf '%s\n' "$output" | grep -E "^[[:space:]]*UPDATE ALL$" >/dev/null; then
-  fail "removed the old non-ascii UPDATE ALL banner header"
-fi
-
-if printf '%s\n' "$output" | grep -F "callsign" >/dev/null; then
-  fail "intro should not contain the old callsign metadata line"
-fi
-
-printf '%s\n' "$output" | grep -F "01110101  01110000" >/dev/null \
-  || fail "expected indented binary divider under the title art"
-
-printf '%s\n' "$output" | grep -F "pending updates" >/dev/null \
-  || fail "expected pending updates block before updater output"
-
-printf '%s\n' "$output" | grep -F "COVERAGE PREFLIGHT" >/dev/null \
-  || fail "expected coverage preflight before update work starts"
-
-printf '%s\n' "$output" | grep -F "Secret safety:" >/dev/null \
-  || fail "expected secret safety explanation in coverage preflight"
-
-printf '%s\n' "$output" | grep -F "BUN RUNTIME" >/dev/null \
-  || fail "expected Bun runtime to be covered or explicitly skipped"
-
-printf '%s\n' "$output" | grep -F "CARGO-INSTALLED CLIS" >/dev/null \
-  || fail "expected cargo-installed CLI coverage"
-
-printf '%s\n' "$output" | grep -F "EDITOR EXTENSIONS" >/dev/null \
-  || fail "expected editor extension coverage"
-
-printf '%s\n' "$output" | grep -F "LINUX FIRMWARE UPDATES" >/dev/null \
-  || fail "expected firmware update coverage"
-
-printf '%s\n' "$output" | grep -F "fwupdmgr get-updates" >/dev/null \
-  || fail "expected firmware dry-run to preview update inspection before applying updates"
-
-printf '%s\n' "$output" | grep -F "apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress-Fancy=0 -o Dpkg::Progress-Fancy=0 update -y" >/dev/null \
-  || fail "expected apt update to disable noisy pseudo-terminal progress output"
-
-printf '%s\n' "$output" | grep -F "shell profiles" >/dev/null \
-  || fail "expected shell profile boundary in coverage preflight"
-
-printf '%s\n' "$output" | grep -F "receipt summary" >/dev/null \
-  || fail "expected final receipt summary"
-
-printf '%s\n' "$output" | grep -F "RUN DETAILS" >/dev/null \
-  || fail "expected professional receipt details section"
-
-printf '%s\n' "$output" | grep -F "CLEANUP NEXT STEPS" >/dev/null \
-  || fail "expected final cleanup next-steps section"
-
-printf '%s\n' "$output" | grep -F "AFTER-RUN CHECK-IN" >/dev/null \
-  || fail "expected final after-run check-in for user concerns"
-
-printf '%s\n' "$output" | grep -F "What to resolve after this run" >/dev/null \
-  || fail "expected final check-in to frame post-run issues plainly"
-
-printf '%s\n' "$output" | grep -F "Cleanup choices are collected before updates start" >/dev/null \
-  || fail "expected final cleanup guidance to explain upfront cleanup choices"
-
-printf '%s\n' "$output" | grep -F "OPTIONAL CHOICES PREFLIGHT" >/dev/null \
-  || fail "expected optional choices preflight before update work starts"
-
-printf '%s\n' "$output" | grep -F "Dry-run:" >/dev/null \
-  || fail "expected dry-run to explain that optional prompt-gated steps are previewed without input"
-
-printf '%s\n' "$output" | grep -F "RUN DETAILS" >/dev/null \
-  || fail "expected professional receipt details section"
-
-printf '%s\n' "$output" | grep -F "before" >/dev/null \
-  || fail "receipt should show stacked before version rows"
-
-printf '%s\n' "$output" | grep -F "after" >/dev/null \
-  || fail "receipt should show stacked after version rows"
-
-if printf '%s\n' "$output" | grep -F "STEP                          RESULT      BEFORE" >/dev/null; then
-  fail "receipt should not use the cramped legacy table header"
-fi
-
-printf '%s\n' "$output" | grep -F "APT CLEANUP?" >/dev/null \
-  || fail "expected large apt cleanup question in the upfront choices section"
-
-printf '%s\n' "$output" | grep -F "sudo apt-get autoremove --purge -y" >/dev/null \
-  || fail "expected cleanup to purge apt-owned auto-removable packages"
-
-printf '%s\n' "$output" | grep -F "sudo apt-get autoclean" >/dev/null \
-  || fail "expected cleanup to run apt autoclean"
-
-printf '%s\n' "$output" | grep -F "sudo apt-get clean" >/dev/null \
-  || fail "expected cleanup to run apt clean"
-
-printf '%s\n' "$output" | grep -F "WORKSTATION CACHE CLEANUP?" >/dev/null \
-  || fail "expected broader workstation cache cleanup prompt"
-
-printf '%s\n' "$output" | grep -F "npm cache clean --force" >/dev/null \
-  || fail "expected npm cache cleanup in dry-run"
-
-printf '%s\n' "$output" | grep -F "timeout 20s uv cache prune" >/dev/null \
-  || fail "expected bounded uv cache prune in dry-run"
-
-printf '%s\n' "$output" | grep -F "disabled snap revisions" >/dev/null \
-  || fail "expected disabled snap revision cleanup in dry-run"
-
-printf '%s\n' "$output" | grep -F "journalctl --vacuum-size=512M" >/dev/null \
-  || fail "expected journal vacuum in dry-run"
-
-awk '
-  /▌ NPM SELF-UPDATE/ { in_npm=1 }
-  in_npm && /version before/ { before=NR }
-  in_npm && /result/ { result=NR }
-  in_npm && /^[[:space:]]*after[[:space:]]/ { after=NR; exit }
-  END {
-    if (!before || !result || !after || !(before < result && result < after)) {
-      exit 1
-    }
-  }
-' <<< "$output" || fail "expected npm self-update to show version before near the top and stacked version after as the final outcome row"
-
-awk '
-  /^╾──── / {
-    expecting_card=1
-    blank_gap=0
-    next
-  }
-  expecting_card {
-    if ($0 == "") {
-      blank_gap++
-      next
-    }
-    if ($0 ~ /^   ▌ /) {
-      if (blank_gap < 1) {
-        exit 1
-      }
-      expecting_card=0
-      next
-    }
-    expecting_card=0
-  }
-' <<< "$output" || fail "expected section headers to keep spacing before section card output"
+  if [ "$(uname -s)" = "Linux" ]; then
+    printf '%s' "$pty_input" | timeout 12s script --quiet --flush --return --command "$pty_cmd" /dev/null || true
+  else
+    printf '%s' "$pty_input" | script -q /dev/null bash -c "$pty_cmd" || true
+  fi
+}
 
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+trap 'rm -rf -- "$tmpdir"' EXIT
 
-cat > "$tmpdir/brew" <<'EOF'
+fake_home="$tmpdir/home"
+posix_bin="$tmpdir/posix-bin"
+mkdir -p -- "$fake_home" "$posix_bin"
+
+# Minimal POSIX/coreutils PATH so host package managers (e.g. /usr/bin/apt-get
+# on Ubuntu CI or /opt/homebrew/bin/brew on macOS) never leak into mocked tests.
+for _u in \
+  bash sh env awk sed grep tr cut cat head tail wc sort uniq fold \
+  mktemp mkdir rm mv cp chmod date uname id readlink dirname basename \
+  sleep kill mkfifo stty tput timeout stdbuf du df find python3 script \
+  true false printf test '[' ls stat touch which; do
+  _p="$(command -v "$_u" 2>/dev/null || true)"
+  if [ -n "$_p" ] && [ -x "$_p" ]; then
+    ln -sf "$_p" "$posix_bin/$_u"
+  fi
+done
+
+make_mock() {
+  local dir="$1" name="$2"
+  mkdir -p -- "$dir"
+  cat > "$dir/$name"
+  chmod +x "$dir/$name"
+}
+
+# ===========================================================================
+# Setup Mocked Toolchains (Ubuntu full, apt live, fwupd exit-2, multi-distro)
+# ===========================================================================
+
+# 1. Full mocked Ubuntu PATH for dry-run UX + safety + brew tap trust
+ubuntu_bin="$tmpdir/ubuntu-bin"
+ubuntu_sentinel="$tmpdir/update-node-ran.sentinel"
+mkdir -p -- "$ubuntu_bin"
+
+for _cmd in \
+  dpkg apt-get apt snap flatpak fwupdmgr node npm corepack pnpm yarn bun \
+  claude codex brew uv pipx rustup cargo gh code codium sudo update-node journalctl; do
+  make_mock "$ubuntu_bin" "$_cmd" <<'EOF'
 #!/usr/bin/env bash
-case "$1" in
-  --version)
-    printf 'Homebrew 6.0.0\n'
+case "$(basename "$0")" in
+  dpkg) echo "Debian dpkg package management program version 1.22.0 (amd64)." ;;
+  apt-get) echo "apt 2.7.14 (amd64)" ;;
+  apt) echo "Listing..." ;;
+  snap) echo "snap    2.63" ;;
+  flatpak) echo "Flatpak 1.14.6" ;;
+  fwupdmgr) echo "runtime org.freedesktop.fwupd 1.9.16" ;;
+  node) echo "v22.11.0" ;;
+  npm)
+    case "${1:-}" in
+      --version) echo "10.9.0" ;;
+      prefix) echo "/tmp/mock-npm-prefix" ;;
+      *) exit 0 ;;
+    esac
     ;;
-  tap)
-    printf 'example/tap\n'
+  corepack) echo "0.29.4" ;;
+  pnpm) echo "9.12.0" ;;
+  yarn)
+    if [ "${COREPACK_ENABLE_DOWNLOAD_PROMPT:-}" != "0" ]; then
+      printf 'missing COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n' >&2
+      exit 42
+    fi
+    case "${1:-}" in
+      --version) printf '99.0.0-test\n' ;;
+      *) exit 0 ;;
+    esac
     ;;
-  tap-info)
-    cat <<'INFO'
+  bun) echo "1.1.30" ;;
+  claude) echo "2.1.0 (Claude Code)" ;;
+  codex) echo "codex-cli 0.42.0" ;;
+  brew)
+    case "${1:-}" in
+      --version) printf 'Homebrew 6.0.0\n' ;;
+      --prefix) printf '/home/linuxbrew/.linuxbrew\n' ;;
+      tap) printf 'example/tap\n' ;;
+      tap-info)
+        cat <<'INFO'
 example/tap: Installed
 Untrusted
 From: https://github.com/example/homebrew-tap
@@ -222,246 +244,420 @@ From: https://github.com/example/homebrew-tap
 mcporter
 poltergeist
 INFO
+        ;;
+      list|outdated) exit 0 ;;
+      *) exit 0 ;;
+    esac
     ;;
-  list)
-    if [ "$2" = "--formula" ] || [ "$2" = "--cask" ]; then
-      exit 0
+  uv) echo "uv 0.5.0" ;;
+  pipx) echo "1.7.1" ;;
+  rustup) echo "rustup 1.27.1" ;;
+  cargo) echo "cargo 1.82.0" ;;
+  gh) echo "gh version 2.60.0" ;;
+  code) echo "1.95.0" ;;
+  codium) echo "1.95.0" ;;
+  update-node)
+    touch "${UPDATE_ALL_TEST_NODE_SENTINEL:-/tmp/update-node-sentinel-unset}"
+    exit 0
+    ;;
+  sudo)
+    if [ "${1:-}" = "-n" ]; then
+      shift
+      [ "${1:-}" = "true" ] && exit 0
+      "$@"
+      exit $?
     fi
+    "$@"
+    exit $?
     ;;
-  outdated)
-    exit 0
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-EOF
-chmod +x "$tmpdir/brew"
-
-cat > "$tmpdir/yarn" <<'EOF'
-#!/usr/bin/env bash
-if [ "${COREPACK_ENABLE_DOWNLOAD_PROMPT:-}" != "0" ]; then
-  printf 'missing COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n' >&2
-  exit 42
-fi
-case "$1" in
-  --version) printf '99.0.0-test\n' ;;
   *) exit 0 ;;
 esac
 EOF
-chmod +x "$tmpdir/yarn"
+done
 
-cat > "$tmpdir/secret" <<'EOF'
+# 2. Live non-interactive apt-get + dpkg mock
+apt_live_bin="$tmpdir/apt-live-bin"
+apt_live_log="$tmpdir/apt-live.log"
+mkdir -p -- "$apt_live_bin"
+
+make_mock "$apt_live_bin" sudo <<'EOF'
 #!/usr/bin/env bash
-case "$1" in
-  has)
-    [ "$2" = "test-sudo-key" ]
+if [ "${1:-}" = "-n" ]; then
+  shift
+  [ "${1:-}" = "true" ] && exit 0
+  "$@"
+  exit $?
+fi
+"$@"
+EOF
+
+make_mock "$apt_live_bin" dpkg <<'EOF'
+#!/usr/bin/env bash
+printf 'CMD=dpkg ARGS=%s DF=%s DNS=%s NR=%s UCF=%s ALC=%s\n' \
+  "$*" "${DEBIAN_FRONTEND:-}" "${DEBCONF_NONINTERACTIVE_SEEN:-}" \
+  "${NEEDRESTART_MODE:-}" "${UCF_FORCE_CONFFOLD:-}" "${APT_LISTCHANGES_FRONTEND:-}" \
+  >> "$UPDATE_ALL_APT_LIVE_LOG"
+case "${1:-}" in
+  --version) echo "Debian dpkg 1.22.0" ;;
+  --audit) echo "broken-mock-pkg: half-configured" ;;
+  --configure) echo "Setting up broken-mock-pkg (1.0.0) ..." ;;
+esac
+exit 0
+EOF
+
+make_mock "$apt_live_bin" apt-get <<'EOF'
+#!/usr/bin/env bash
+printf 'CMD=apt-get ARGS=%s DF=%s DNS=%s NR=%s UCF=%s ALC=%s\n' \
+  "$*" "${DEBIAN_FRONTEND:-}" "${DEBCONF_NONINTERACTIVE_SEEN:-}" \
+  "${NEEDRESTART_MODE:-}" "${UCF_FORCE_CONFFOLD:-}" "${APT_LISTCHANGES_FRONTEND:-}" \
+  >> "$UPDATE_ALL_APT_LIVE_LOG"
+case "${1:-}" in
+  --version) echo "apt 2.7.14 (amd64)" ;;
+  *) echo "Unpacking mock-pkg (1.2.0) over (1.1.0) ..." ;;
+esac
+exit 0
+EOF
+
+make_mock "$apt_live_bin" apt <<'EOF'
+#!/usr/bin/env bash
+echo "Listing..."
+exit 0
+EOF
+
+# 3. Live fwupdmgr exit-code-2 mock
+fwupd_live_bin="$tmpdir/fwupd-live-bin"
+mkdir -p -- "$fwupd_live_bin"
+make_mock "$fwupd_live_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-n" ]; then
+  shift
+  [ "${1:-}" = "true" ] && exit 0
+  "$@"
+  exit $?
+fi
+"$@"
+EOF
+make_mock "$fwupd_live_bin" fwupdmgr <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) echo "runtime org.freedesktop.fwupd 1.9.16" ;;
+  refresh) exit 0 ;;
+  get-updates)
+    echo "Devices with no available firmware updates: System Firmware"
+    exit 2
     ;;
-  get)
-    [ "$2" = "test-sudo-key" ] || exit 1
-    printf 'fake-password\n'
-    ;;
-  *)
-    exit 1
-    ;;
+  *) exit 0 ;;
 esac
 EOF
-chmod +x "$tmpdir/secret"
 
-cat > "$tmpdir/sudo" <<'EOF'
+# 4. Multi-distro simulated PATHs (Fedora dnf, Immutable rpm-ostree+dnf, Arch pacman, Alpine apk, brew-only)
+fedora_bin="$tmpdir/fedora-bin"
+ostree_bin="$tmpdir/ostree-bin"
+arch_bin="$tmpdir/arch-bin"
+alpine_bin="$tmpdir/alpine-bin"
+brew_only_bin="$tmpdir/brew-only-bin"
+
+make_mock "$fedora_bin" dnf <<'EOF'
+#!/usr/bin/env bash
+echo "dnf 4.21.0"
+EOF
+make_mock "$fedora_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+"$@"
+EOF
+
+make_mock "$ostree_bin" rpm-ostree <<'EOF'
+#!/usr/bin/env bash
+printf 'rpm-ostree:\n Version: '\''2026.1'\''\n'
+EOF
+make_mock "$ostree_bin" dnf <<'EOF'
+#!/usr/bin/env bash
+echo "dnf 4.21.0"
+EOF
+make_mock "$ostree_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+"$@"
+EOF
+
+make_mock "$arch_bin" pacman <<'EOF'
+#!/usr/bin/env bash
+echo "Pacman v6.1.0"
+EOF
+make_mock "$arch_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+"$@"
+EOF
+
+make_mock "$alpine_bin" apk <<'EOF'
+#!/usr/bin/env bash
+echo "apk-tools 2.14.4"
+EOF
+make_mock "$alpine_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+"$@"
+EOF
+
+make_mock "$brew_only_bin" brew <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) echo "Homebrew 6.0.0" ;;
+  --prefix) echo "/home/linuxbrew/.linuxbrew" ;;
+  *) exit 0 ;;
+esac
+EOF
+
+# ===========================================================================
+# Launch slow dry-run / live-mock jobs in parallel for <15s total runtime
+# ===========================================================================
+bg_pids=""
+run_bg() {
+  local name="$1"; shift
+  (
+    "$@" > "$tmpdir/out-${name}.txt" 2>&1
+    printf '%s\n' "$?" > "$tmpdir/rc-${name}.txt"
+  ) &
+  bg_pids="$bg_pids $!"
+}
+
+run_bg ubuntu-dry env HOME="$fake_home" PATH="$ubuntu_bin:$posix_bin" \
+  UPDATE_ALL_TEST_NODE_SENTINEL="$ubuntu_sentinel" \
+  "$UPDATE_ALL" --dry-run --no-anim --no-color
+
+run_bg apt-live env HOME="$fake_home" PATH="$apt_live_bin:$posix_bin" \
+  UPDATE_ALL_APT_LIVE_LOG="$apt_live_log" \
+  "$UPDATE_ALL" --non-interactive --no-security-scan --no-anim --no-color
+
+run_bg fwupd-live env HOME="$fake_home" PATH="$fwupd_live_bin:$posix_bin" \
+  "$UPDATE_ALL" --firmware --non-interactive --no-security-scan --no-anim --no-color
+
+run_bg fedora-dry env HOME="$fake_home" PATH="$fedora_bin:$posix_bin" \
+  "$UPDATE_ALL" --dry-run --no-anim --no-color
+
+run_bg ostree-dry env HOME="$fake_home" PATH="$ostree_bin:$posix_bin" \
+  "$UPDATE_ALL" --dry-run --no-anim --no-color
+
+run_bg arch-dry env HOME="$fake_home" PATH="$arch_bin:$posix_bin" \
+  "$UPDATE_ALL" --dry-run --no-anim --no-color
+
+run_bg alpine-dry env HOME="$fake_home" PATH="$alpine_bin:$posix_bin" \
+  "$UPDATE_ALL" --dry-run --no-anim --no-color
+
+run_bg brew-only-dry env HOME="$fake_home" PATH="$brew_only_bin:$posix_bin" \
+  "$UPDATE_ALL" --dry-run --no-anim --no-color
+
+run_bg receipt-visual env HOME="$fake_home" PATH="$posix_bin" \
+  UPDATE_ALL_RECEIPT_SELFTEST=visual "$UPDATE_ALL" --no-anim --no-color
+
+run_bg visual-preview env HOME="$fake_home" PATH="$posix_bin" \
+  UPDATE_ALL_VISUAL_PREVIEW=1 "$UPDATE_ALL" --no-anim --no-color
+
+if [ -x "$DIST_BUNDLE" ]; then
+  run_bg dist-visual env HOME="$fake_home" PATH="$posix_bin" \
+    UPDATE_ALL_RECEIPT_SELFTEST=visual "$DIST_BUNDLE" --no-anim --no-color
+fi
+
+# ===========================================================================
+# Foreground Fast Unit & Selftest Suites (run concurrently with bg jobs)
+# ===========================================================================
+
+# --- Suite 4: Stdin isolation across ALL 6 runners ---
+stdin_bin="$tmpdir/stdin-bin"
+make_mock "$stdin_bin" sudo <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-n" ]; then
+  shift
+  [ "${1:-}" = "true" ] && exit 0
+  "$@"
+  exit $?
+fi
+"$@"
+EOF
+
+stdin_runner_output="$(
+  printf '%s\n' keyboard keyboard keyboard keyboard keyboard keyboard \
+    | PATH="$stdin_bin:$posix_bin" UPDATE_ALL_STDIN_SELFTEST=1 UPDATE_ALL_STDIN_INCLUDE_SUDO=1 \
+      "$UPDATE_ALL" --no-anim --no-color
+)"
+assert_contains "$stdin_runner_output" "run-cmd-closed" "run_cmd must close stdin"
+assert_contains "$stdin_runner_output" "run-capture-closed" "run_cmd_capture must close stdin"
+assert_contains "$stdin_runner_output" "run-bounded-closed" "run_bounded must close stdin"
+assert_contains "$stdin_runner_output" "run-shell-closed" "run_shell must close stdin"
+assert_contains "$stdin_runner_output" "run-shell-capture-closed" "run_shell_capture must close stdin"
+assert_contains "$stdin_runner_output" "sudo-cmd-closed" "sudo_cmd must close stdin"
+assert_not_contains "$stdin_runner_output" "-open" "no runner may read from update-all stdin"
+
+# --- Suite 5: Secret redaction (all 7 shapes + NUL byte stripping) ---
+openai_token="sk-$(printf 'a%.0s' {1..24})"
+github_token="ghp_$(printf 'b%.0s' {1..24})"
+github_pat="github_pat_$(printf 'c%.0s' {1..24})"
+slack_token="xoxb-$(printf 'd%.0s' {1..24})"
+aws_prefix="AK"
+aws_token="${aws_prefix}IA$(printf '9%.0s' {1..16})"
+pem_hdr="-----BEG""IN RSA PRI""VATE KEY-----"
+generic_val="fakeSecretValue987654"
+
+redacted_all="$(
+  printf 'OPENAI=%s\nGH=%s\nPAT=%s\nSLACK=%s\nAWS=%s\n%s\nMY_API_TOKEN=%s\n' \
+    "$openai_token" "$github_token" "$github_pat" "$slack_token" "$aws_token" "$pem_hdr" "$generic_val" \
+    | UPDATE_ALL_REDACTION_SELFTEST=1 "$UPDATE_ALL" --no-anim --no-color
+)"
+assert_contains "$redacted_all" "[REDACTED_OPENAI_KEY]" "expected OpenAI key redaction"
+assert_contains "$redacted_all" "[REDACTED_GITHUB_TOKEN]" "expected GitHub token redaction"
+assert_contains "$redacted_all" "[REDACTED_SLACK_TOKEN]" "expected Slack token redaction"
+assert_contains "$redacted_all" "[REDACTED_AWS_ACCESS_KEY]" "expected AWS access key redaction"
+assert_contains "$redacted_all" "[REDACTED_PRIVATE_KEY_BEGIN]" "expected private key header redaction"
+assert_contains "$redacted_all" "MY_API_TOKEN=[REDACTED]" "expected generic key=value secret redaction"
+assert_not_contains "$redacted_all" "$openai_token" "OpenAI test token must not leak"
+assert_not_contains "$redacted_all" "$github_token" "GitHub test token must not leak"
+assert_not_contains "$redacted_all" "$github_pat" "GitHub fine-grained PAT must not leak"
+assert_not_contains "$redacted_all" "$slack_token" "Slack test token must not leak"
+assert_not_contains "$redacted_all" "$aws_token" "AWS access key must not leak"
+assert_not_contains "$redacted_all" "$pem_hdr" "PEM private key header must not leak"
+assert_not_contains "$redacted_all" "$generic_val" "Generic secret value must not leak"
+
+control_cleaned="$(printf '^@Hit:1 https://example.invalid stable InRelease\n' | UPDATE_ALL_REDACTION_SELFTEST=1 "$UPDATE_ALL" --no-anim --no-color)"
+assert_not_contains "$control_cleaned" "^@" "literal NUL marker should be stripped"
+assert_contains "$control_cleaned" "Hit:1 https://example.invalid stable InRelease" "text after literal NUL marker should remain"
+
+actual_nul_cleaned="$(printf '\000Hit:1 https://example.invalid stable InRelease\n' | UPDATE_ALL_REDACTION_SELFTEST=1 "$UPDATE_ALL" --no-anim --no-color)"
+assert_contains "$actual_nul_cleaned" "Hit:1 https://example.invalid stable InRelease" "actual NUL byte stripping must preserve text"
+assert_not_contains "$actual_nul_cleaned" "^@" "actual NUL byte should not render as ^@"
+
+# --- Suite 6: Sudo secret-prime selftest ---
+sudo_secret_bin="$tmpdir/sudo-secret-bin"
+sudo_log="$tmpdir/sudo-secret.log"
+make_mock "$sudo_secret_bin" secret <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  has) [ "${2:-}" = "test-sudo-key" ] ;;
+  get)
+    [ "${2:-}" = "test-sudo-key" ] || exit 1
+    printf 'fake-password\n'
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+make_mock "$sudo_secret_bin" sudo <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$UPDATE_ALL_FAKE_SUDO_LOG"
-if [ "$1" = "-n" ]; then
-  exit 1
-fi
-if [ "$1" = "-S" ]; then
+if [ "${1:-}" = "-n" ]; then exit 1; fi
+if [ "${1:-}" = "-S" ]; then
   shift
-  [ "$1" = "-p" ] && shift 2
+  [ "${1:-}" = "-p" ] && shift 2
   IFS= read -r _password || true
-  if [ "$1" = "-v" ]; then
+  if [ "${1:-}" = "-v" ]; then
     printf '^@sudo validation should not run when a sudo secret is available\n'
     exit 0
   fi
   "$@"
   exit $?
 fi
-if [ "$1" = "-v" ]; then
+if [ "${1:-}" = "-v" ]; then
   printf '^@sudo validation should not run when a sudo secret is available\n'
   exit 0
 fi
 "$@"
 EOF
-chmod +x "$tmpdir/sudo"
 
-sudo_log="$tmpdir/sudo.log"
-sudo_output="$(PATH="$tmpdir:$PATH" UPDATE_ALL_SUDO_SECRET_KEY=test-sudo-key UPDATE_ALL_FAKE_SUDO_LOG="$sudo_log" UPDATE_ALL_SUDO_SELFTEST=secret-prime "$UPDATE_ALL" --no-anim --no-color)"
-printf '%s\n' "$sudo_output" | grep -F "sudo command ok" >/dev/null \
-  || fail "expected sudo secret selftest command to run"
-if printf '%s\n' "$sudo_output" | grep -F "^@" >/dev/null; then
-  fail "sudo secret selftest should not leak validation control markers"
-fi
-if grep -F -- "-v" "$sudo_log" >/dev/null; then
-  fail "sudo secret selftest should skip sudo validation when secret helper is available"
-fi
-
-receipt_output="$(UPDATE_ALL_RECEIPT_SELFTEST=visual "$UPDATE_ALL" --no-anim --no-color)"
-printf '%s\n' "$receipt_output" | grep -F "WHAT CHANGED" >/dev/null \
-  || fail "expected final receipt to lead with a clear what-changed section"
-printf '%s\n' "$receipt_output" | grep -F "old -> new" >/dev/null \
-  || fail "expected final receipt to explain version arrows"
-printf '%s\n' "$receipt_output" | grep -F "yarn (corepack)" >/dev/null \
-  || fail "expected changed tool name in what-changed section"
-printf '%s\n' "$receipt_output" | grep -F "before 1.22.22" >/dev/null \
-  || fail "expected updated tools to show old version on a stacked before row"
-printf '%s\n' "$receipt_output" | grep -F "after  4.17.0" >/dev/null \
-  || fail "expected updated tools to show new version on a stacked after row"
-printf '%s\n' "$receipt_output" | grep -F "before libevent 2.1.12_1" >/dev/null \
-  || fail "expected Homebrew formula old version on a stacked before row"
-printf '%s\n' "$receipt_output" | grep -F "after  2.1.13" >/dev/null \
-  || fail "expected Homebrew formula new version on a stacked after row"
-printf '%s\n' "$receipt_output" | grep -F "before pillow 12.2.0" >/dev/null \
-  || fail "expected uv tool old version on a stacked before row"
-printf '%s\n' "$receipt_output" | grep -F "after  12.3.0" >/dev/null \
-  || fail "expected uv tool new version on a stacked after row"
-printf '%s\n' "$receipt_output" | grep -F "NO ACTION NEEDED" >/dev/null \
-  || fail "expected final receipt to group unchanged, ok, and skipped rows separately"
-printf '%s\n' "$receipt_output" | grep -F "NEEDS YOUR ATTENTION" >/dev/null \
-  || fail "expected final receipt to group manual follow-up items"
-printf '%s\n' "$receipt_output" | grep -F "Firmware needs manual attention" >/dev/null \
-  || fail "expected manual firmware attention to be visible in the terminal receipt"
-printf '%s\n' "$receipt_output" | grep -F "means:" >/dev/null \
-  || fail "expected attention items to explain what they mean"
-printf '%s\n' "$receipt_output" | grep -F "action:" >/dev/null \
-  || fail "expected attention items to state the next action"
-
-brew_output="$(PATH="$tmpdir:$PATH" "$UPDATE_ALL" --dry-run --no-anim --no-color)"
-
-printf '%s\n' "$brew_output" | grep -F "99.0.0-test" >/dev/null \
-  || fail "expected Corepack-managed yarn version probe to run with download prompts disabled"
-
-if printf '%s\n' "$brew_output" | grep -F "missing COREPACK_ENABLE_DOWNLOAD_PROMPT=0" >/dev/null; then
-  fail "yarn version probe should not allow Corepack download prompts"
+sudo_output="$(
+  PATH="$sudo_secret_bin:$posix_bin" \
+  UPDATE_ALL_SUDO_SECRET_KEY=test-sudo-key \
+  UPDATE_ALL_FAKE_SUDO_LOG="$sudo_log" \
+  UPDATE_ALL_SUDO_SELFTEST=secret-prime \
+  "$UPDATE_ALL" --no-anim --no-color
+)"
+assert_contains "$sudo_output" "sudo command ok" "sudo secret-prime selftest should run command"
+assert_not_contains "$sudo_output" "^@" "sudo secret-prime must not leak ^@ control markers"
+if [ -r "$sudo_log" ] && grep -F -- "-v" "$sudo_log" >/dev/null; then
+  fail "sudo secret-prime should skip sudo -v when secret helper is available"
+else
+  pass
 fi
 
-printf '%s\n' "$brew_output" | grep -F "brew tap trust preflight" >/dev/null \
-  || fail "expected Homebrew tap trust preflight section"
+# --- Suite 7: Firmware --all vs --firmware, classifiers, firmware summary, interactive PTY 'a' ---
+prompt_bin="$tmpdir/prompt-bin"
+make_mock "$prompt_bin" fwupdmgr <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+make_mock "$prompt_bin" apt-get <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+make_mock "$prompt_bin" brew <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) printf 'Homebrew 6.0.0\n' ;;
+  tap) printf 'example/tap\n' ;;
+  tap-info)
+    cat <<'INFO'
+example/tap: Installed
+Untrusted
+From: https://github.com/example/homebrew-tap
+==> Formulae
+mcporter
+INFO
+    ;;
+  *) exit 0 ;;
+esac
+EOF
 
-printf '%s\n' "$brew_output" | grep -F "Plain English:" >/dev/null \
-  || fail "expected plain-English explanation for untrusted taps"
+all_flag_prompt="$(
+  HOME="$fake_home" PATH="$prompt_bin:$posix_bin" \
+  UPDATE_ALL_PROMPT_SELFTEST=1 "$UPDATE_ALL" --all --no-anim --no-color
+)"
+assert_contains "$all_flag_prompt" "firmware choice: no" "--all must keep firmware choice as no"
+assert_contains "$all_flag_prompt" "apt cleanup choice: yes" "--all must auto-approve apt cleanup"
+assert_contains "$all_flag_prompt" "workstation cleanup choice: yes" "--all must auto-approve workstation cleanup"
 
-printf '%s\n' "$brew_output" | grep -F "Gold standard:" >/dev/null \
-  || fail "expected recommended gold-standard action for untrusted taps"
+fw_flag_prompt="$(
+  HOME="$fake_home" PATH="$prompt_bin:$posix_bin" \
+  UPDATE_ALL_PROMPT_SELFTEST=1 "$UPDATE_ALL" --all --firmware --no-anim --no-color
+)"
+assert_contains "$fw_flag_prompt" "firmware choice: yes" "--firmware must set firmware choice to yes"
 
-printf '%s\n' "$brew_output" | grep -F "INSIGHT" >/dev/null \
-  || fail "expected pretty insight panel for untrusted taps"
+all_prompt_output="$(
+  run_in_pty $'a\n' "HOME='$fake_home' PATH='$prompt_bin:$posix_bin' UPDATE_ALL_PROMPT_SELFTEST=1 '$UPDATE_ALL' --no-anim --no-color"
+)"
+all_prompt_clean="$(printf '%s\n' "$all_prompt_output" | tr -d '\r')"
+prompt_count="$(printf '%s\n' "$all_prompt_clean" | grep -c '^? ' || true)"
+assert_eq "$prompt_count" "1" "typing 'a' should answer every optional prompt after one question"
+assert_contains "$all_prompt_clean" "all mode: yes to every remaining optional question" "interactive 'a' mode should explain behavior"
+assert_contains "$all_prompt_clean" "firmware choice: yes" "interactive 'a' mode should save yes for firmware"
+assert_contains "$all_prompt_clean" "brew untap example/tap: yes" "interactive 'a' mode should save yes for untap"
+assert_contains "$all_prompt_clean" "apt cleanup choice: yes" "interactive 'a' mode should save yes for apt cleanup"
+assert_contains "$all_prompt_clean" "workstation cleanup choice: yes" "interactive 'a' mode should save yes for workstation cleanup"
 
-printf '%s\n' "$brew_output" | grep -F "A tap is an extra Homebrew package source" >/dev/null \
-  || fail "expected tap to be explained in plain English"
+# Classifier selftests (preserved)
+if printf 'Update State:       Failed\nUpdate Error:       failed to write data to efivarsfs\n' \
+  | UPDATE_ALL_CLASSIFY_SELFTEST=fwupd-manual "$UPDATE_ALL" --no-anim --no-color; then pass
+else fail "expected fwupd efivars failure to classify as manual firmware attention"; fi
 
-printf '%s\n' "$brew_output" | grep -F "not a malware verdict" >/dev/null \
-  || fail "expected calm malware-vs-trust clarification"
-
-printf '%s\n' "$brew_output" | grep -F "Do not panic" >/dev/null \
-  || fail "expected explicit panic guidance"
-
-printf '%s\n' "$brew_output" | grep -F "Untap means" >/dev/null \
-  || fail "expected untap to be explained in plain English"
-
-printf '%s\n' "$brew_output" | grep -F "removes this package source from Homebrew" >/dev/null \
-  || fail "expected untap effect to be clear"
-
-printf '%s\n' "$brew_output" | grep -F "does not delete your projects" >/dev/null \
-  || fail "expected untap safety boundary to be clear"
-
-printf '%s\n' "$brew_output" | grep -F "Homebrew may refuse if installed tools still depend on it" >/dev/null \
-  || fail "expected untap dependency/refusal caveat"
-
-printf '%s\n' "$brew_output" | grep -F "Recommended: untap it now" >/dev/null \
-  || fail "expected unused untrusted tap removal recommendation"
-
-printf '%s\n' "$brew_output" | grep -F "Trust source action" >/dev/null \
-  || fail "expected untrusted tap action in final check-in"
-
-printf '%s\n' "$brew_output" | grep -F "brew untap example/tap" >/dev/null \
-  || fail "expected exact untap command to be shown in dry-run"
-
-printf '%s\n' "$brew_output" | grep -F "env -u BASH_ENV -u ENV bash --noprofile --norc -c" >/dev/null \
-  || fail "expected compound shell commands to avoid shell startup files"
-
-openai_token="sk-$(printf 'a%.0s' {1..24})"
-github_token="ghp_$(printf 'b%.0s' {1..24})"
-redacted="$(printf 'OPENAI_API_KEY=%s GITHUB_TOKEN=%s\n' "$openai_token" "$github_token" | UPDATE_ALL_REDACTION_SELFTEST=1 "$UPDATE_ALL" --no-anim --no-color)"
-
-printf '%s\n' "$redacted" | grep -F "[REDACTED_OPENAI_KEY]" >/dev/null \
-  || fail "expected OpenAI-style token redaction"
-
-printf '%s\n' "$redacted" | grep -F "[REDACTED_GITHUB_TOKEN]" >/dev/null \
-  || fail "expected GitHub-style token redaction"
-
-if printf '%s\n' "$redacted" | grep -F "$openai_token" >/dev/null; then
-  fail "OpenAI-style test token leaked through redaction"
-fi
-
-if printf '%s\n' "$redacted" | grep -F "$github_token" >/dev/null; then
-  fail "GitHub-style test token leaked through redaction"
-fi
-
-control_cleaned="$(printf '^@Hit:1 https://example.invalid stable InRelease\n' | UPDATE_ALL_REDACTION_SELFTEST=1 "$UPDATE_ALL" --no-anim --no-color)"
-if printf '%s\n' "$control_cleaned" | grep -F "^@" >/dev/null; then
-  fail "log stream should strip literal NUL marker noise before coloring output"
-fi
-
-actual_nul_cleaned="$(printf '\000Hit:1 https://example.invalid stable InRelease\n' | UPDATE_ALL_REDACTION_SELFTEST=1 "$UPDATE_ALL" --no-anim --no-color)"
-printf '%s\n' "$actual_nul_cleaned" | grep -F "Hit:1 https://example.invalid stable InRelease" >/dev/null \
-  || fail "log stream should keep apt source lines after stripping actual NUL bytes"
-if printf '%s\n' "$actual_nul_cleaned" | grep -F "^@" >/dev/null; then
-  fail "log stream should strip actual NUL byte noise before coloring output"
-fi
-
-stdin_runner_output="$(printf 'keyboard\nkeyboard\nkeyboard\nkeyboard\nkeyboard\n' | UPDATE_ALL_STDIN_SELFTEST=1 "$UPDATE_ALL" --no-anim --no-color)"
-printf '%s\n' "$stdin_runner_output" | grep -F "run-cmd-closed" >/dev/null \
-  || fail "run_cmd should not consume keyboard input from update-all stdin"
-printf '%s\n' "$stdin_runner_output" | grep -F "run-capture-closed" >/dev/null \
-  || fail "run_cmd_capture should not consume keyboard input from update-all stdin"
-printf '%s\n' "$stdin_runner_output" | grep -F "run-bounded-closed" >/dev/null \
-  || fail "run_bounded should not consume keyboard input from update-all stdin"
-printf '%s\n' "$stdin_runner_output" | grep -F "run-shell-closed" >/dev/null \
-  || fail "run_shell should not consume keyboard input from update-all stdin"
-printf '%s\n' "$stdin_runner_output" | grep -F "run-shell-capture-closed" >/dev/null \
-  || fail "run_shell_capture should not consume keyboard input from update-all stdin"
-if printf '%s\n' "$stdin_runner_output" | grep -F -- "-open" >/dev/null; then
-  fail "updater-managed commands must not read from update-all stdin"
-fi
-
-printf 'Update State:       Failed\nUpdate Error:       failed to write data to efivarsfs\n' \
-  | UPDATE_ALL_CLASSIFY_SELFTEST=fwupd-manual "$UPDATE_ALL" --no-anim --no-color \
-  || fail "expected fwupd efivars failure to classify as manual firmware attention"
-
-printf 'npm warn allow-scripts   @anthropic-ai/claude-code@2.1.195 (postinstall: node install.cjs)\n' \
-  | UPDATE_ALL_CLASSIFY_SELFTEST=npm-claude-script "$UPDATE_ALL" --no-anim --no-color \
-  || fail "expected npm Claude Code allow-scripts warning to trigger trusted script retry"
+if printf 'npm warn allow-scripts   @anthropic-ai/claude-code@2.1.195 (postinstall: node install.cjs)\n' \
+  | UPDATE_ALL_CLASSIFY_SELFTEST=npm-claude-script "$UPDATE_ALL" --no-anim --no-color; then pass
+else fail "expected npm Claude Code allow-scripts warning to trigger trusted script retry"; fi
 
 # shellcheck disable=SC2016 # Fixture intentionally contains literal backticks from uv output.
-printf 'warning: The package `typer==0.26.8` does not have an extra named `all`\n' \
-  | UPDATE_ALL_CLASSIFY_SELFTEST=uv-stale-extra "$UPDATE_ALL" --no-anim --no-color \
-  || fail "expected uv stale optional-extra warning to be recognized"
+if printf 'warning: The package `typer==0.26.8` does not have an extra named `all`\n' \
+  | UPDATE_ALL_CLASSIFY_SELFTEST=uv-stale-extra "$UPDATE_ALL" --no-anim --no-color; then pass
+else fail "expected uv stale optional-extra warning to be recognized"; fi
 
-printf '==> Upgraded 3 outdated packages\n' \
-  | UPDATE_ALL_CLASSIFY_SELFTEST=updated-output "$UPDATE_ALL" --no-anim --no-color \
-  || fail "expected Homebrew upgraded package output to count as an updated step"
+if printf '==> Upgraded 3 outdated packages\n' \
+  | UPDATE_ALL_CLASSIFY_SELFTEST=updated-output "$UPDATE_ALL" --no-anim --no-color; then pass
+else fail "expected plural Homebrew upgraded output to imply update"; fi
 
-printf '==> Upgraded 1 outdated package\n' \
-  | UPDATE_ALL_CLASSIFY_SELFTEST=updated-output "$UPDATE_ALL" --no-anim --no-color \
-  || fail "expected singular Homebrew upgraded package output to count as an updated step"
+if printf '==> Upgraded 1 outdated package\n' \
+  | UPDATE_ALL_CLASSIFY_SELFTEST=updated-output "$UPDATE_ALL" --no-anim --no-color; then pass
+else fail "expected singular Homebrew upgraded output to imply update"; fi
 
-printf 'changed 2 packages in 5s\n' \
-  | UPDATE_ALL_CLASSIFY_SELFTEST=updated-output "$UPDATE_ALL" --no-anim --no-color \
-  || fail "expected npm changed package output to count as an updated step"
+if printf 'changed 2 packages in 5s\n' \
+  | UPDATE_ALL_CLASSIFY_SELFTEST=updated-output "$UPDATE_ALL" --no-anim --no-color; then pass
+else fail "expected npm changed package output to imply update"; fi
 
 if printf 'Already up-to-date.\n' \
   | UPDATE_ALL_CLASSIFY_SELFTEST=updated-output "$UPDATE_ALL" --no-anim --no-color; then
   fail "already-up-to-date output should not count as an updated step"
-fi
+else pass; fi
 
 firmware_fixture='Razer Blade
 │
@@ -482,60 +678,366 @@ firmware_fixture='Razer Blade
         Urgency:          High
         Issue:            CVE-2026-8863
 '
-
 firmware_summary="$(printf '%s\n' "$firmware_fixture" | UPDATE_ALL_FIRMWARE_SELFTEST=summary "$UPDATE_ALL" --no-anim --no-color)"
-printf '%s\n' "$firmware_summary" | grep -F "FIRMWARE REVIEW" >/dev/null \
-  || fail "expected firmware output to be summarized as a clear review card"
-printf '%s\n' "$firmware_summary" | grep -F "Plain English:" >/dev/null \
-  || fail "expected firmware summary to explain the situation plainly"
-printf '%s\n' "$firmware_summary" | grep -F "KEK CA" >/dev/null \
-  || fail "expected firmware summary to keep device names"
-printf '%s\n' "$firmware_summary" | grep -F "2011 -> 2023" >/dev/null \
-  || fail "expected firmware summary to show current firmware to new firmware"
-printf '%s\n' "$firmware_summary" | grep -F "UEFI dbx" >/dev/null \
-  || fail "expected firmware summary to show all firmware devices needing attention"
-printf '%s\n' "$firmware_summary" | grep -F "20230501 -> 20260402" >/dev/null \
-  || fail "expected firmware summary to show dbx current to new version"
-printf '%s\n' "$firmware_summary" | grep -F "action:" >/dev/null \
-  || fail "expected firmware summary to include a next action"
-if printf '%s\n' "$firmware_summary" | grep -E "Device ID|GUID|Checksum" >/dev/null; then
-  fail "default firmware summary should not dump raw scary firmware identifiers"
+assert_contains "$firmware_summary" "FIRMWARE REVIEW" "expected firmware review heading"
+assert_contains "$firmware_summary" "Plain English:" "expected plain English firmware explanation"
+assert_contains "$firmware_summary" "KEK CA" "expected KEK CA device name"
+assert_contains "$firmware_summary" "2011 -> 2023" "expected KEK CA version arrow"
+assert_contains "$firmware_summary" "UEFI dbx" "expected UEFI dbx device name"
+assert_contains "$firmware_summary" "20230501 -> 20260402" "expected UEFI dbx version arrow"
+assert_contains "$firmware_summary" "action:" "expected firmware action row"
+assert_not_regex "$firmware_summary" "Device ID|GUID|Checksum" "firmware summary should hide raw IDs"
+
+late_prompt_calls="$(grep -nE 'elif confirm_step|if confirm_step' "$UPDATE_ALL" "$ROOT_DIR"/lib/*.sh || true)"
+assert_eq "$late_prompt_calls" "" "optional y/N prompts must be collected upfront, not mid-run"
+
+# --- Suite 8: Watcher selftests, EWMA timings, invalid flags, NO_COLOR ---
+frames_utf8="$(LC_ALL=en_US.UTF-8 UPDATE_ALL_WATCHER_SELFTEST=frames "$UPDATE_ALL" --no-anim --no-color)"
+assert_contains "$frames_utf8" "style=hybrid frame0=·" "UTF-8 hybrid frame0 glyph"
+assert_contains "$frames_utf8" "style=braille frame0=⣾" "UTF-8 braille frame0 glyph"
+assert_contains "$frames_utf8" "style=anthropic frame0=·" "UTF-8 anthropic frame0 glyph"
+
+frames_ascii="$(LC_ALL=C UPDATE_ALL_WATCHER_SELFTEST=frames "$UPDATE_ALL" --no-anim --no-color)"
+assert_contains "$frames_ascii" "style=hybrid frame0=|" "LC_ALL=C ASCII fallback for hybrid"
+assert_contains "$frames_ascii" "style=braille frame0=|" "LC_ALL=C ASCII fallback for braille"
+assert_contains "$frames_ascii" "style=anthropic frame0=|" "LC_ALL=C ASCII fallback for anthropic"
+
+stream_cap_out="$(UPDATE_ALL_WATCHER_SELFTEST=stream-capture "$UPDATE_ALL" --no-anim --no-color)"
+assert_contains "$stream_cap_out" "CAPTURE_RC=7" "stream-capture must preserve exit code 7"
+assert_contains "$stream_cap_out" "CAPTURE_VAL=line-one" "stream-capture must preserve captured output"
+assert_contains "$stream_cap_out" "token=[REDACTED_OPENAI_KEY]" "stream-capture must redact OpenAI token"
+_raw_sk_frag="sk-""1234567890"
+assert_not_contains "$stream_cap_out" "$_raw_sk_frag" "stream-capture must not leak raw secret prefix"
+
+leaked_t0="$(date +%s)"
+leaked_out="$(UPDATE_ALL_WATCHER_SELFTEST=leaked-fd "$UPDATE_ALL" --no-anim --no-color)"
+leaked_rc=$?
+leaked_t1="$(date +%s)"
+leaked_elapsed=$((leaked_t1 - leaked_t0))
+assert_eq "$leaked_rc" "0" "leaked-fd selftest should exit 0"
+assert_contains "$leaked_out" "parent-done" "leaked-fd selftest should capture parent output"
+if [ "$leaked_elapsed" -lt 4 ]; then
+  pass
+else
+  fail "leaked-fd selftest hung on background sleep 5 (elapsed=${leaked_elapsed}s, expected <4s)"
 fi
 
-cat > "$tmpdir/fwupdmgr" <<'EOF'
+timings_file="$tmpdir/timings.tsv"
+timings_out1="$(UPDATE_ALL_TIMINGS_FILE="$timings_file" UPDATE_ALL_WATCHER_SELFTEST=timings "$UPDATE_ALL" --no-anim --no-color)"
+assert_contains "$timings_out1" "EST_APT=30" "first timings run should record 30s"
+assert_file_contains "$timings_file" "apt-upgrade	30" "timings file should persist apt-upgrade=30"
+
+printf 'apt-upgrade\t100\n' > "$timings_file"
+timings_out2="$(UPDATE_ALL_TIMINGS_FILE="$timings_file" UPDATE_ALL_WATCHER_SELFTEST=timings "$UPDATE_ALL" --no-anim --no-color)"
+assert_contains "$timings_out2" "EST_APT=72" "EWMA of prev=100 and actual=30 should be 72"
+assert_file_contains "$timings_file" "apt-upgrade	72" "timings file should persist EWMA value 72"
+
+bad_watcher_rc=0
+"$UPDATE_ALL" --watcher=bad >/dev/null 2>&1 || bad_watcher_rc=$?
+assert_eq "$bad_watcher_rc" "2" "invalid --watcher=bad must exit with code 2"
+
+bad_bar_rc=0
+"$UPDATE_ALL" --bar=bad >/dev/null 2>&1 || bad_bar_rc=$?
+assert_eq "$bad_bar_rc" "2" "invalid --bar=bad must exit with code 2"
+
+no_color_pty_out="$(
+  run_in_pty "" "HOME='$fake_home' PATH='$posix_bin' NO_COLOR=1 TERM=xterm-256color UPDATE_ALL_WATCHER_SELFTEST=frames '$UPDATE_ALL' --no-anim"
+)"
+if printf '%s' "$no_color_pty_out" | LC_ALL=C grep -q $'\033'; then
+  fail "NO_COLOR=1 emitted ANSI escape sequences in PTY output"
+else
+  pass
+fi
+
+# --- Suite 11: Safety Coach (OSV malicious package + exposed ports) ---
+safety_bin="$tmpdir/safety-bin"
+npm_uninstall_sentinel="$tmpdir/npm-uninstall-ran.sentinel"
+make_mock "$safety_bin" npm <<'EOF'
 #!/usr/bin/env bash
+touch "${UPDATE_ALL_TEST_NPM_SENTINEL:-/tmp/npm-sentinel-unset}"
 exit 0
 EOF
-chmod +x "$tmpdir/fwupdmgr"
 
-all_prompt_output="$(
-  {
-    printf 'a\n' \
-      | timeout 12s script --quiet --flush --return --command "env PATH='$tmpdir:$PATH' UPDATE_ALL_PROMPT_SELFTEST=1 '$UPDATE_ALL' --no-anim --no-color" /dev/null
-  } || true
+osv_mock="$tmpdir/osv-mock.json"
+cat > "$osv_mock" <<'EOF'
+{
+  "results": [
+    {
+      "vulns": [
+        {
+          "id": "MAL-2026-0001",
+          "summary": "Malicious npm package exfiltrates environment variables",
+          "affected": [
+            {
+              "package": {
+                "name": "evil-demo-cli",
+                "ecosystem": "npm"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+EOF
+
+osv_out="$(
+  HOME="$fake_home" PATH="$safety_bin:$posix_bin" \
+  UPDATE_ALL_TEST_NPM_SENTINEL="$npm_uninstall_sentinel" \
+  UPDATE_ALL_SAFETY_SELFTEST=osv \
+  UPDATE_ALL_OSV_MOCK_FILE="$osv_mock" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
 )"
+assert_contains "$osv_out" "CRITICAL · MALICIOUS" "OSV selftest must flag CRITICAL · MALICIOUS"
+assert_contains "$osv_out" "MAL-2026-0001" "OSV selftest must include advisory ID"
+assert_contains "$osv_out" "npm uninstall -g evil-demo-cli" "OSV selftest must show exact npm uninstall remedy"
+assert_contains "$osv_out" "Non-interactive / preview mode: no remediation commands were executed." "non-interactive Safety Coach must state no commands ran"
+assert_file_not_exists "$npm_uninstall_sentinel" "non-interactive Safety Coach must NEVER auto-delete malicious packages"
 
-prompt_count="$(printf '%s\n' "$all_prompt_output" | grep -c '^? ' || true)"
-[ "$prompt_count" -eq 1 ] \
-  || fail "typing a should answer every optional prompt after one question"
+ports_mock="$tmpdir/ports-mock.txt"
+cat > "$ports_mock" <<'EOF'
+tcp LISTEN 0 128 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=101,fd=5))
+tcp LISTEN 0 511 0.0.0.0:3000 0.0.0.0:* users:(("node",pid=202,fd=18))
+EOF
 
-printf '%s\n' "$all_prompt_output" | grep -F "all mode: yes to every remaining optional question" >/dev/null \
-  || fail "expected a/all mode to explain that remaining optional questions are answered yes"
+ports_out="$(
+  HOME="$fake_home" PATH="$posix_bin" \
+  UPDATE_ALL_SAFETY_SELFTEST=ports \
+  UPDATE_ALL_PORTS_MOCK_FILE="$ports_mock" \
+  "$UPDATE_ALL" --non-interactive --no-anim --no-color
+)"
+assert_contains "$ports_out" "WARN · EXPOSED PORT" "ports selftest must flag exposed non-loopback listener"
+assert_contains "$ports_out" "node (tcp/3000 on all interfaces (0.0.0.0))" "ports selftest must report exposed port 3000"
+assert_contains "$ports_out" "sudo ufw deny 3000/tcp" "ports selftest must provide ufw deny guidance"
+assert_not_contains "$ports_out" "5432" "ports selftest must exclude loopback 127.0.0.1:5432"
+assert_not_contains "$ports_out" "postgres" "ports selftest must exclude loopback process postgres"
 
-printf '%s\n' "$all_prompt_output" | grep -F "firmware choice: yes" >/dev/null \
-  || fail "expected all mode to save yes for firmware"
+# ===========================================================================
+# Wait for all parallel dry-run / live-mock / dist jobs, then assert results
+# ===========================================================================
+for _pid in $bg_pids; do
+  wait "$_pid" || true
+done
 
-printf '%s\n' "$all_prompt_output" | grep -F "brew untap example/tap: yes" >/dev/null \
-  || fail "expected all mode to save yes for Homebrew untap"
+read_rc() { cat "$tmpdir/rc-${1}.txt" 2>/dev/null || printf '99'; }
+read_out() { cat "$tmpdir/out-${1}.txt" 2>/dev/null || true; }
 
-printf '%s\n' "$all_prompt_output" | grep -F "apt cleanup choice: yes" >/dev/null \
-  || fail "expected all mode to save yes for apt cleanup"
+# --- Suite 1, 2a, 3, 10, 11c: Full Mocked Ubuntu Dry-Run ---
+output="$(read_out ubuntu-dry)"
+assert_eq "$(read_rc ubuntu-dry)" "0" "mocked Ubuntu dry-run must exit 0"
+assert_file_not_exists "$ubuntu_sentinel" "dry-run must NEVER execute update-node"
 
-printf '%s\n' "$all_prompt_output" | grep -F "workstation cleanup choice: yes" >/dev/null \
-  || fail "expected all mode to save yes for workstation cache cleanup"
+assert_contains "$output" "OPENAI CODEX CLI" "expected prominent uppercase unit title for Codex"
+assert_contains "$output" "claude update" "expected Claude Code to use first-party updater"
+assert_contains "$output" "codex update" "expected Codex CLI to use first-party updater"
+assert_not_contains "$output" "npm install -g @anthropic-ai/claude-code@latest" "Claude Code must not update via npm install"
+assert_not_contains "$output" "npm install -g @openai/codex@latest" "Codex CLI must not update via npm install"
+assert_contains "$output" "version before" "expected readable version before row"
+assert_contains "$output" "after" "expected readable stacked version outcome rows"
+assert_contains "$output" "path" "expected executable path rows"
+assert_not_contains "$output" "version = " "version rows should not use noisy prefixes"
+assert_not_contains "$output" "VERSION BEFORE" "version labels should not be shouty uppercase"
+assert_contains "$output" "purpose" "expected purpose label instead of does"
+assert_not_regex "$output" '^[[:space:]]+does[[:space:]]+' "legacy does label should not be present"
+assert_contains "$output" "FLATPAK APPS" "expected flatpak package card"
+assert_contains "$output" "result" "expected result rows"
+assert_not_contains "$output" "mode" "intro/dry-run should not contain legacy mode metadata line"
+assert_not_regex "$output" '^[[:space:]]*UPDATE ALL$' "old non-ascii UPDATE ALL header must not exist"
+assert_not_contains "$output" "callsign" "intro should not contain legacy callsign metadata line"
+assert_contains "$output" "01110101  01110000" "expected indented binary divider under title art"
+assert_contains "$output" "pending updates" "expected pending updates block"
+assert_contains "$output" "COVERAGE PREFLIGHT" "expected coverage preflight"
+assert_contains "$output" "Secret safety:" "expected secret safety explanation in coverage preflight"
+assert_contains "$output" "BUN RUNTIME" "expected Bun runtime card"
+assert_contains "$output" "CARGO-INSTALLED CLIS" "expected cargo-installed CLI coverage"
+assert_contains "$output" "VS CODE EXTENSIONS" "expected VS Code extension coverage when code exists"
+assert_contains "$output" "VSCODIUM EXTENSIONS" "expected VSCodium extension coverage when codium exists"
+assert_contains "$output" "LINUX FIRMWARE UPDATES" "expected firmware update coverage"
+assert_contains "$output" "fwupdmgr get-updates" "expected firmware dry-run preview"
+assert_contains "$output" "apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress-Fancy=0 -o Dpkg::Progress-Fancy=0 update -y" "expected non-PTY apt update flags"
+assert_contains "$output" "shell profiles" "expected shell profile boundary in coverage preflight"
+assert_contains "$output" "receipt summary" "expected final receipt summary"
+assert_contains "$output" "RUN DETAILS" "expected receipt RUN DETAILS section"
+assert_contains "$output" "CLEANUP NEXT STEPS" "expected cleanup next-steps section"
+assert_contains "$output" "AFTER-RUN CHECK-IN" "expected after-run check-in section"
+assert_contains "$output" "What to resolve after this run" "expected plain-English check-in framing"
+assert_contains "$output" "Cleanup choices are collected before updates start" "expected upfront cleanup guidance"
+assert_contains "$output" "OPTIONAL CHOICES PREFLIGHT" "expected optional choices preflight"
+assert_contains "$output" "Dry-run:" "expected dry-run explanation for optional prompt-gated steps"
+assert_contains "$output" "before" "receipt should show stacked before version rows"
+assert_not_contains "$output" "STEP                          RESULT      BEFORE" "receipt must not use cramped legacy header"
+assert_contains "$output" "APT CLEANUP?" "expected large apt cleanup question in upfront choices"
+assert_contains "$output" "sudo apt-get autoremove --purge -y" "expected apt autoremove purge preview"
+assert_contains "$output" "sudo apt-get autoclean" "expected apt autoclean preview"
+assert_contains "$output" "sudo apt-get clean" "expected apt clean preview"
+assert_contains "$output" "WORKSTATION CACHE CLEANUP?" "expected workstation cache cleanup prompt"
+assert_contains "$output" "npm cache clean --force" "expected npm cache cleanup in dry-run"
+assert_contains "$output" "timeout 20s uv cache prune" "expected bounded uv cache prune in dry-run"
+assert_contains "$output" "disabled snap revisions" "expected disabled snap revision cleanup in dry-run"
+assert_contains "$output" "journalctl --vacuum-size=512M" "expected journal vacuum in dry-run"
 
-late_prompt_calls="$(grep -nE 'elif confirm_step|if confirm_step' "$UPDATE_ALL" || true)"
-if [ -n "$late_prompt_calls" ]; then
-  printf '%s\n' "$late_prompt_calls" >&2
-  fail "optional y/N prompts should be collected up front, not called mid-run"
+# Cleanup redesign: no full-home find ~ or __pycache__ crawl
+assert_not_contains "$output" "find ~" "cleanup dry-run must not contain full-home find ~ crawl"
+assert_not_contains "$output" "__pycache__" "cleanup dry-run must not contain __pycache__ crawl"
+
+# P0 non-interactive apt-get & dpkg env/flags in dry-run
+assert_contains "$output" "DEBIAN_FRONTEND=noninteractive" "apt dry-run must set DEBIAN_FRONTEND=noninteractive"
+assert_contains "$output" "DEBCONF_NONINTERACTIVE_SEEN=true" "apt dry-run must set DEBCONF_NONINTERACTIVE_SEEN=true"
+assert_contains "$output" "NEEDRESTART_MODE=l" "apt dry-run must set NEEDRESTART_MODE=l"
+assert_contains "$output" "UCF_FORCE_CONFFOLD=1" "apt dry-run must set UCF_FORCE_CONFFOLD=1"
+assert_contains "$output" "APT_LISTCHANGES_FRONTEND=none" "apt dry-run must set APT_LISTCHANGES_FRONTEND=none"
+assert_contains "$output" "--force-confdef" "apt dry-run must pass --force-confdef"
+assert_contains "$output" "--force-confold" "apt dry-run must pass --force-confold"
+assert_contains "$output" "DPkg::Lock::Timeout=60" "apt dry-run must pass DPkg::Lock::Timeout=60"
+
+# Corepack yarn probe + Brew tap trust preflight (preserved)
+assert_contains "$output" "99.0.0-test" "Corepack yarn version probe must run with download prompts disabled"
+assert_not_contains "$output" "missing COREPACK_ENABLE_DOWNLOAD_PROMPT=0" "yarn probe must set COREPACK_ENABLE_DOWNLOAD_PROMPT=0"
+assert_contains "$output" "brew tap trust preflight" "expected Homebrew tap trust preflight section"
+assert_contains "$output" "Plain English:" "expected plain-English explanation for untrusted taps"
+assert_contains "$output" "Gold standard:" "expected gold-standard action for untrusted taps"
+assert_contains "$output" "INSIGHT" "expected insight panel for untrusted taps"
+assert_contains "$output" "A tap is an extra Homebrew package source" "expected tap plain-English explanation"
+assert_contains "$output" "not a malware verdict" "expected calm malware-vs-trust clarification"
+assert_contains "$output" "Do not panic" "expected explicit panic guidance"
+assert_contains "$output" "Untap means" "expected untap plain-English explanation"
+assert_contains "$output" "removes this package source from Homebrew" "expected untap effect clarity"
+assert_contains "$output" "does not delete your projects" "expected untap safety boundary"
+assert_contains "$output" "Homebrew may refuse if installed tools still depend on it" "expected untap dependency caveat"
+assert_contains "$output" "Recommended: untap it now" "expected unused untrusted tap recommendation"
+assert_contains "$output" "Trust source action" "expected untrusted tap action in final check-in"
+assert_contains "$output" "brew untap example/tap" "expected exact untap command in dry-run"
+assert_contains "$output" "env -u BASH_ENV -u ENV bash --noprofile --norc -c" "expected compound shell calls to avoid startup files"
+
+# Card version ordering & blank-line section spacing contracts
+if awk '
+  /▌ NPM SELF-UPDATE/ { in_npm=1 }
+  in_npm && /version before/ { before=NR }
+  in_npm && /result/ { result=NR }
+  in_npm && /^[[:space:]]*after[[:space:]]/ { after=NR; exit }
+  END { if (!before || !result || !after || !(before < result && result < after)) exit 1 }
+' <<< "$output"; then pass
+else fail "expected npm self-update version before < result < after ordering"; fi
+
+if awk '
+  /^╾──── / { expecting_card=1; blank_gap=0; next }
+  expecting_card {
+    if ($0 == "") { blank_gap++; next }
+    if ($0 ~ /^   ▌ /) {
+      if (blank_gap < 1) exit 1
+      expecting_card=0; next
+    }
+    expecting_card=0
+  }
+' <<< "$output"; then pass
+else fail "expected blank line between section headers and card output"; fi
+
+# --- Suite 2b: Live mocked non-interactive apt-get & dpkg P0 verification ---
+assert_eq "$(read_rc apt-live)" "0" "live mocked apt/dpkg run must exit 0"
+apt_live_entries="$(cat "$apt_live_log" 2>/dev/null || true)"
+assert_contains "$apt_live_entries" "CMD=dpkg ARGS=--configure -a --force-confdef --force-confold DF=noninteractive DNS=true NR=l UCF=1 ALC=none" \
+  "live dpkg --configure must receive all non-interactive env vars and confdef/confold flags"
+assert_contains "$apt_live_entries" "CMD=apt-get ARGS=-o Dpkg::Use-Pty=0" "live apt-get must run"
+assert_contains "$apt_live_entries" "DPkg::Lock::Timeout=60" "live apt-get must pass DPkg::Lock::Timeout=60"
+assert_contains "$apt_live_entries" "--force-confdef" "live apt-get upgrade must pass --force-confdef"
+assert_contains "$apt_live_entries" "--force-confold" "live apt-get upgrade must pass --force-confold"
+assert_contains "$apt_live_entries" "DF=noninteractive DNS=true NR=l UCF=1 ALC=none" "live apt-get must receive all 5 non-interactive env vars"
+
+# --- Suite 7b: Live fwupdmgr exit code 2 -> UNCHANGED (NOT FAIL) ---
+fwupd_live_out="$(read_out fwupd-live)"
+assert_eq "$(read_rc fwupd-live)" "0" "fwupdmgr get-updates exit 2 must not fail update-all"
+assert_contains "$fwupd_live_out" "UNCHANGED" "fwupdmgr exit 2 must be tracked as UNCHANGED"
+assert_contains "$fwupd_live_out" "No firmware updates available" "fwupdmgr exit 2 must explain no firmware updates available"
+assert_not_contains "$fwupd_live_out" "✗ FAIL" "fwupdmgr exit 2 must NOT produce any FAIL status"
+
+# --- Suite 9: Universal Linux multi-distro discovery ---
+fedora_out="$(read_out fedora-dry)"
+assert_eq "$(read_rc fedora-dry)" "0" "Fedora (dnf) dry-run must exit 0"
+assert_contains "$fedora_out" "pkg manager: dnf" "Fedora dry-run must detect dnf"
+assert_contains "$fedora_out" "DNF OS PACKAGES" "Fedora dry-run must show DNF OS PACKAGES card"
+assert_contains "$fedora_out" "dnf upgrade -y" "Fedora dry-run must preview dnf upgrade -y"
+assert_contains "$fedora_out" "DNF CLEANUP?" "Fedora dry-run must show DNF CLEANUP?"
+assert_not_contains "$fedora_out" "$ sudo env DEBIAN_FRONTEND=noninteractive" "Fedora dry-run must never invoke apt-get"
+
+ostree_out="$(read_out ostree-dry)"
+assert_eq "$(read_rc ostree-dry)" "0" "Immutable Fedora (rpm-ostree) dry-run must exit 0"
+assert_contains "$ostree_out" "pkg manager: rpm-ostree" "rpm-ostree must be prioritized over dnf"
+assert_contains "$ostree_out" "IMMUTABLE OS IMAGE" "rpm-ostree dry-run must show IMMUTABLE OS IMAGE card"
+assert_contains "$ostree_out" "rpm-ostree upgrade --check" "rpm-ostree dry-run must preview rpm-ostree upgrade --check"
+assert_not_contains "$ostree_out" "dnf upgrade -y" "rpm-ostree host must not call dnf upgrade -y"
+assert_not_contains "$ostree_out" "$ sudo env DEBIAN_FRONTEND=noninteractive" "rpm-ostree host must never invoke apt-get"
+
+arch_out="$(read_out arch-dry)"
+assert_eq "$(read_rc arch-dry)" "0" "Arch (pacman) dry-run must exit 0"
+assert_contains "$arch_out" "pkg manager: pacman" "Arch dry-run must detect pacman"
+assert_contains "$arch_out" "ARCH OS PACKAGES" "Arch dry-run must show ARCH OS PACKAGES card"
+assert_contains "$arch_out" "pacman -Syu --noconfirm" "Arch dry-run must preview pacman -Syu --noconfirm"
+assert_contains "$arch_out" "PACMAN CACHE CLEANUP?" "Arch dry-run must show PACMAN CACHE CLEANUP?"
+assert_not_contains "$arch_out" "$ sudo env DEBIAN_FRONTEND=noninteractive" "Arch dry-run must never invoke apt-get"
+
+alpine_out="$(read_out alpine-dry)"
+assert_eq "$(read_rc alpine-dry)" "0" "Alpine (apk) dry-run must exit 0"
+assert_contains "$alpine_out" "pkg manager: apk" "Alpine dry-run must detect apk"
+assert_contains "$alpine_out" "ALPINE OS PACKAGES" "Alpine dry-run must show ALPINE OS PACKAGES card"
+assert_contains "$alpine_out" "apk update" "Alpine dry-run must preview apk update"
+assert_contains "$alpine_out" "apk upgrade" "Alpine dry-run must preview apk upgrade"
+assert_contains "$alpine_out" "APK CACHE CLEANUP?" "Alpine dry-run must show APK CACHE CLEANUP?"
+assert_not_contains "$alpine_out" "$ sudo env DEBIAN_FRONTEND=noninteractive" "Alpine dry-run must never invoke apt-get"
+
+brew_only_out="$(read_out brew-only-dry)"
+assert_eq "$(read_rc brew-only-dry)" "0" "brew-only dry-run must exit 0"
+assert_contains "$brew_only_out" "pkg manager: none" "brew-only dry-run must detect pkg manager: none"
+assert_contains "$brew_only_out" "HOMEBREW FORMULAE" "brew-only dry-run must show HOMEBREW FORMULAE card"
+assert_contains "$brew_only_out" "EDITOR EXTENSIONS" "missing editor CLIs must show EDITOR EXTENSIONS skipped card"
+assert_not_contains "$brew_only_out" "$ sudo env DEBIAN_FRONTEND=noninteractive" "brew-only dry-run must never invoke apt-get"
+
+# --- Suite 12: Receipt changelog table, visual preview, & standalone bundle ---
+receipt_output="$(read_out receipt-visual)"
+assert_eq "$(read_rc receipt-visual)" "0" "receipt visual selftest must exit 0"
+assert_contains "$receipt_output" "WHAT CHANGED" "receipt must lead with WHAT CHANGED"
+assert_contains "$receipt_output" "old -> new" "receipt must explain version arrows"
+assert_contains "$receipt_output" "PROGRAM / PACKAGE" "receipt changelog table must show PROGRAM / PACKAGE column"
+assert_contains "$receipt_output" "yarn (corepack)" "receipt must include yarn (corepack)"
+assert_contains "$receipt_output" "before 1.22.22" "receipt must show yarn before version"
+assert_contains "$receipt_output" "after  4.17.0" "receipt must show yarn after version"
+assert_contains "$receipt_output" "before libevent 2.1.12_1" "receipt must show Homebrew formula before version"
+assert_contains "$receipt_output" "after  2.1.13" "receipt must show Homebrew formula after version"
+assert_contains "$receipt_output" "before pillow 12.2.0" "receipt must show uv tool before version"
+assert_contains "$receipt_output" "after  12.3.0" "receipt must show uv tool after version"
+assert_contains "$receipt_output" "NO ACTION NEEDED" "receipt must group quiet rows under NO ACTION NEEDED"
+assert_contains "$receipt_output" "NEEDS YOUR ATTENTION" "receipt must group manual follow-up under NEEDS YOUR ATTENTION"
+assert_contains "$receipt_output" "Firmware needs manual attention" "receipt must show manual firmware attention"
+assert_contains "$receipt_output" "means:" "attention items must explain means:"
+assert_contains "$receipt_output" "action:" "attention items must explain action:"
+
+preview_output="$(read_out visual-preview)"
+assert_eq "$(read_rc visual-preview)" "0" "UPDATE_ALL_VISUAL_PREVIEW=1 must exit 0"
+assert_contains "$preview_output" "01110101  01110000" "visual preview must show title art binary divider"
+assert_contains "$preview_output" "COVERAGE PREFLIGHT" "visual preview must show coverage preflight"
+assert_contains "$preview_output" "SAFETY COACH" "visual preview must show Safety Coach preview"
+assert_contains "$preview_output" "MAL-2026-0001" "visual preview must show sample OSV finding"
+assert_contains "$preview_output" "PORT-TCP-3000" "visual preview must show sample exposed port finding"
+assert_contains "$preview_output" "WHAT CHANGED" "visual preview must show receipt changelog table"
+
+if [ -x "$DIST_BUNDLE" ]; then
+  if bash -n "$DIST_BUNDLE"; then pass
+  else fail "dist/update-all failed bash -n syntax check"; fi
+
+  dist_help="$("$DIST_BUNDLE" --help)"
+  assert_contains "$dist_help" "--dry-run" "dist/update-all --help must list --dry-run"
+  assert_contains "$dist_help" "--firmware" "dist/update-all --help must list --firmware"
+  assert_contains "$dist_help" "--watcher=MODE" "dist/update-all --help must list --watcher=MODE"
+
+  dist_visual="$(read_out dist-visual)"
+  assert_eq "$(read_rc dist-visual)" "0" "dist/update-all visual receipt selftest must exit 0"
+  assert_contains "$dist_visual" "WHAT CHANGED" "dist/update-all visual receipt must render WHAT CHANGED"
+  assert_contains "$dist_visual" "yarn (corepack)" "dist/update-all visual receipt must render changelog entries"
+else
+  fail "standalone bundle dist/update-all is missing or not executable (run scripts/build-standalone.sh)"
 fi
+
+END_S="$(date +%s)"
+ELAPSED=$((END_S - START_S))
+printf 'Test summary: %d passed, %d failed (%ds)\n' "$PASS_COUNT" "$FAIL_COUNT" "$ELAPSED"
+[ "$FAIL_COUNT" -eq 0 ]

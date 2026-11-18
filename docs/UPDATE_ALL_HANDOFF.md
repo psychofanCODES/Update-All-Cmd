@@ -1,175 +1,123 @@
 # Update All Handoff
 
-Last updated: 2026-06-07 EDT
+Last updated: 2026-11-18 UTC
 
 ## Project
 
-`update-all` is a Bash CLI for beginner-friendly Linux workstation updates.
-Clone it anywhere you keep small tools, then use `install.sh` to place an
-`update-all` command on your PATH.
+`update-all` is a modular, local-first Bash CLI for universal Linux developer workstation updates.
+Clone it anywhere, run `./install.sh` to place `update-all` on `~/.local/bin`, or run
+`./scripts/build-standalone.sh` to build a single portable `dist/update-all` file.
+
+## Modular Architecture
+
+The program is split into focused, Bash 3.2+ parse-compatible modules (macOS Bash 3.2.57 and
+Linux Bash 5.x, with runtime `BASH_VERSINFO[0]` guards for Bash 4+/5+ features):
+
+- `bin/update-all` — CLI entrypoint, option parser, selftest dispatcher, and main orchestration. Sources `lib/*.sh` unless `_UA_BUNDLED=1`.
+- `lib/colors_and_glyphs.sh` — 256-color/8-color/0-color palette, monochrome Unicode glyphs (`↗ ✓ = ✗ · ▲ ◆ → │ ▌`), ASCII fallback (`UPDATE_ALL_ASCII=1`), banners, and tool cards.
+- `lib/tui.sh` — DECSTBM 2-row persistent progress dock (`--bar=bottom|top|off`), kinetic watcher (`--watcher=hybrid|braille|anthropic`), EWMA self-calibrating ETA store (`timings.tsv`), `SIGWINCH` dynamic resize, and compact min-size handling.
+- `lib/runner.sh` — zero-stall FIFO-backed concurrent watcher loop (`stdbuf -oL -eL`, `timeout -k`), fast-path secret redactor, closed-stdin (`</dev/null`) execution, `sudo` keepalive, and non-interactive apt wrapper.
+- `lib/discover.sh` — `/etc/os-release` host/distro discovery, safe `PATH` augmentation, bounded version probes, `COVERAGE PREFLIGHT`, and upfront optional choice collection.
+- `lib/updaters.sh` — universal Linux package-manager and dev-tool updaters with before/after tracking and per-package delta capture for the receipt table.
+- `lib/cleanup.sh` — distro-aware system package cleanup (`apt`/`dnf`/`pacman`/`apk`) and safe bounded workstation cache cleanup with reclaimed disk space tracking.
+- `lib/safety_coach.sh` — cached Homebrew tap trust inspection, OSV.dev batch advisory/malicious-package audit (`MAL-*`, Critical/High CVEs/GHSAs), read-only open-port & firewall check, and guided post-receipt remediation walkthrough.
+- `lib/receipt.sh` — upgraded `RECEIPT` summary + reclaimed disk space, dramatic Unicode `WHAT CHANGED` table (`PROGRAM / PACKAGE | BEFORE → AFTER | VIA`), `NEEDS YOUR ATTENTION`, compact `NO ACTION NEEDED`, `RUN DETAILS`, `CLEANUP NEXT STEPS`, and `AFTER-RUN CHECK-IN`.
+- `scripts/build-standalone.sh` — concatenates `lib/*.sh` + `bin/update-all` with `_UA_BUNDLED=1` into standalone `dist/update-all`.
 
 ## Current Product Direction
 
-- Keep it local-first and transparent.
-- Do not replace package managers; call first-party/package-manager commands.
-- Teach the user what is happening before scary output starts.
-- Favor explicit prompts over surprise removal.
-- Keep the public repo free of machine secrets and private paths in committed code.
+- Keep it local-first, universal across Linux distros, and transparent.
+- Never replace package managers; call first-party/package-manager commands cleanly.
+- Guarantee zero mid-run hangs or surprise Enter prompts.
+- Favor explicit upfront choices and guided end-of-run remediation over silent deletion.
+- Keep the public repo free of real user home paths, private IPs, secrets, and tokens.
 
 ## Current UX Contract
 
-- Intro title art uses the current two-line binary divider (`update` on top, centered `all`), with no old plain-text `UPDATE ALL` line.
-- Dark teal binary divider under the title.
-- Large section banners with optional animation.
-- Interactive section progress strips are 45 cells wide, up from the old 30-cell strip, and stay on the amber/orange brand color.
-- Section headers include one blank line above and one blank line below the divider so each step has readable spacing while keeping the loading strip close.
-- Prominent package/tool cards:
-  - big uppercase unit title
-  - bold package value
-  - `version before` near the top, with a muted teal label and only the actual version value highlighted
-  - separate quieter `path` row when the version probe includes an executable path
-  - `version after` as the final outcome row after `result` and optional `note`, with a slightly brighter label than `version before`
-  - muted purpose text
-  - visible `result` and optional `note`
-- Normal package-manager chatter is dimmed so logs stop becoming a wall of white.
-- Apt repository lines (`Hit:`, `Get:`, `Ign:`) and progress lines (`Fetched`,
-  `Reading package lists`) use separate colors.
-- Missing tools still print cards and end as `SKIP` so beginners learn what they are.
-- Firmware checks print a `FIRMWARE REVIEW` card with device, release, old -> new firmware version, urgency, plain-English meaning, and action. The default live surface should not dump raw `Device ID`, `GUID`, or checksum fields.
-- Final section is `RECEIPT`, starting with the beginner dashboard sections `WHAT CHANGED (old -> new)`, `NEEDS YOUR ATTENTION`, and `NO ACTION NEEDED`, followed by detailed stacked `before` / `after` version rows and `note:` audit rows.
-- `CLEANUP NEXT STEPS` appears at the end of the receipt and summarizes apt cleanup, workstation cache cleanup, and the interactive cleanup rule for live runs.
-- Claude Code and Codex use their first-party updaters (`claude update`, `codex update`) instead of relying on npm install to refresh the active binaries.
-- `COVERAGE PREFLIGHT` appears before update work and tells the user which installed surfaces will be checked, which common surfaces are skipped, and which categories remain manual by design.
-- Command output goes through a defensive redactor for common secret shapes before printing.
-- Internal compound shell commands use `env -u BASH_ENV -u ENV bash --noprofile --norc -c ...` so update-all does not source shell startup files for its own control flow.
-- `docs/terminal-preview.svg` is a sanitized colored SVG generated from a real `update-all --dry-run` terminal capture; keep it visually faithful when the CLI's first screen changes.
+- Signature amber `UPDATE ALL` intro art with dark-teal two-line binary divider (`update` / centered `all`).
+- Refined monochrome Unicode glyphs (`↗ ✓ = ✗ · ▲ ◆ → │ ▌ ⣾ ⣽ ⣻ ✽`) — never chunky color emojis — with ASCII fallback (`UPDATE_ALL_ASCII=1`).
+- Anchored 2-row bottom TUI dock (`--bar=bottom` default, `--bar=top`, `--bar=off`):
+  - Row 1: `━━ [████████████░░░░░░░░] 62% · ~38s left · Step 8/13 · TOOLS · ↗3 ✓4 =1 ·0 ✗0 ━━`
+  - Row 2: `✽ Upgrading Homebrew formulae…   ⣾⣽⣻   00:18 · ● live`
+  - Persists per-step EWMA durations in `${XDG_CACHE_HOME:-~/.cache}/update-all/timings.tsv` for calibrated ETAs.
+  - Handles `SIGWINCH` resize dynamically and adapts gracefully on small terminals (`<60x14` compact mode, `<50x12` inline fallback).
+- Live streamed logs render behind a subtle vertical `│` gutter (`C_FRAME`) with dimmed normal chatter and semantic coloring for errors, warnings, upgrades, and apt repository/progress lines.
+- Prominent package/tool cards (`▌ UNIT TITLE`, `package`, `version before`, quieter `path`, `purpose`, `result`, `note`, `version after`).
+- `FIRMWARE REVIEW` cards summarize device, release, version arrow, urgency, meaning, and next action without dumping raw GUIDs/checksums. Firmware updates remain strictly opt-in (`--firmware` or interactive prompt), never auto-flashed by `--all`.
+- Final `RECEIPT` includes summary counters, reclaimed disk space (`412 MB` etc.), dramatic Unicode `WHAT CHANGED` table (`PROGRAM / PACKAGE | BEFORE → AFTER | VIA` with bright cyan before, bold amber `→`, bright mint after), `NEEDS YOUR ATTENTION`, compact `NO ACTION NEEDED`, `RUN DETAILS`, `CLEANUP NEXT STEPS`, and `AFTER-RUN CHECK-IN`.
+- `docs/terminal-preview.svg` and `docs/receipt-and-safety-preview.svg` are sanitized colored vector SVGs generated from real 256-color `lib/*.sh` output; keep both visually faithful when TUI, receipt, or Safety Coach layouts change.
 
-## Pending Update Lists
+## Zero-Stall & Non-Interactive Architecture
 
-Implemented:
+- Unbuffered live streaming: `stdbuf -oL -eL` on external commands plus `stdbuf -i0 -o0 tr -d '\000'` in the FIFO pipeline so output streams immediately without stalling on pipe buffers.
+- Non-interactive apt/dpkg: `DEBIAN_FRONTEND=noninteractive`, `DEBCONF_NONINTERACTIVE_SEEN=true`, `NEEDRESTART_MODE=l`, `UCF_FORCE_CONFFOLD=1`, `APT_LISTCHANGES_FRONTEND=none`, `Dpkg::Options::=--force-confdef/--force-confold`, `DPkg::Lock::Timeout=60`, `Acquire::http/https::Timeout=30`, `Acquire::Retries=3`.
+- Closed stdin (`</dev/null`) across `run_cmd`, `sudo_cmd`, and probes so commands never block waiting for keyboard input mid-run.
+- Background `sudo` keepalive refreshes cached credentials every 30s (cleanly torn down via `EXIT`/`INT`/`TERM` traps); if a session still expires interactively, `tui_pause_for_tty` / `tui_resume_after_tty` cleanly pause and restore the scroll region.
+- Bounded timeouts (`timeout -k`) on all tiers: `UPDATE_ALL_PROBE_TIMEOUT=15s`, `UPDATE_ALL_COREPACK_TIMEOUT=90s`, `UPDATE_ALL_NODE_TIMEOUT=300s`, `UPDATE_ALL_STEP_TIMEOUT=600s`, `UPDATE_ALL_BUILD_TIMEOUT=1200s`.
 
-- `apt`: `apt list --upgradable`, parsed as package old -> new.
-- `npm globals`: `npm outdated -g --depth=0`, parsed as current -> latest.
-- Homebrew/Linuxbrew: `brew outdated --verbose`, parsed where brew output exposes old/new.
+## Universal Coverage Behavior
 
-Not yet implemented as old -> new preflight tables:
+Auto-discovered and updated when present (missing tools record `SKIP`):
 
-- Snap, Flatpak, Bun, uv, pipx, rustup, cargo-installed CLIs, gh extensions,
-  and editor extensions old -> new preflight lists. Their native
-  output is still streamed and receipt-tracked.
-
-## Coverage Behavior
-
-`update-all` should update installed common workstation surfaces, then explain
-manual boundaries instead of silently touching risky project-specific areas.
-
-Currently handled or explicitly skipped:
-
-- dpkg/apt, snap, flatpak, Node/update-node, corepack, pnpm, yarn, Bun, npm
-  globals, Claude Code, Codex, Homebrew/Linuxbrew, uv, pipx, rustup,
-  cargo-installed CLIs when `cargo-install-update` already exists, GitHub CLI
-  extensions, VS Code/VSCodium extensions, firmware via `fwupdmgr`, apt cleanup,
-  and workstation cache cleanup.
+- **Linux system managers:** `dpkg`/`apt`, `rpm-ostree`, `dnf5`/`dnf`/`yum`, `pacman`, `zypper`, `apk`, `xbps` (`xbps-install`).
+- **Desktop/firmware:** `snap`, `flatpak`, `fwupdmgr` (opt-in).
+- **Developer runtimes & CLIs:** `brew` (Homebrew/Linuxbrew), `node`/`update-node`, `mise`, `volta`, `fnm`, `corepack`, `pnpm`, `yarn`, `bun`, `deno`, `npm` (self + globals), `claude`, `codex`, `uv`, `pipx`, `rustup`, `cargo` (`cargo-install-update`), `gh` extensions, `code`/`codium`/`code-insiders` extensions.
 
 Manual by design:
 
-- Project repositories, active agent runtimes, containers/images, conda
-  environments, large LLM weights, and shell profile edits.
+- Project repositories, active agent runtimes (Hermes/OpenClaw), containers/images, conda environments, AUR PKGBUILDs, large LLM weights, and shell profile edits.
 
 ## Cleanup Behavior
 
-Cleanup is split into two explicit prompts. Removal stays opt-in and visible.
-At any optional live prompt, typing `a` or `all` once answers yes to every remaining
-optional question in that run, including both cleanup prompts.
+Cleanup stays opt-in and split into two explicit choices (auto-approved with `-a`/`--all` or typing `a`/`all` upfront):
 
-The first prompt is apt-owned only and gated by a large `APT CLEANUP?` prompt.
-When the user answers yes, it runs:
+1. **System package cleanup** (distro-aware):
+   - `apt`: `apt-get autoremove --purge -y`, `apt-get autoclean`, `apt-get clean`
+   - `dnf`: `dnf autoremove -y`, `dnf clean packages`
+   - `pacman`: `pacman -Sc --noconfirm`
+   - `apk`: `apk cache clean`
+2. **Bounded workstation cache cleanup** (explicit safe targets only — **no slow full-`$HOME` crawl**):
+   - `npm cache clean --force`, `rm -rf -- ~/.npm/_npx`
+   - `pip3 cache purge`, `brew cleanup -s`, `timeout 20s uv cache prune`
+   - Explicit `~/.cache/{camoufox,ms-playwright,BraveSoftware,electron,node-gyp,node,Homebrew,pip}`
+   - `~/.codex/.tmp/plugins` and `~/.codex/.tmp/plugins.sha`
+   - Disabled snap revisions and `sudo journalctl --vacuum-size=512M` (when systemd is active)
 
-```bash
-sudo apt-get autoremove --purge -y
-sudo apt-get autoclean
-sudo apt-get clean
-```
+Before/after disk footprints are measured via bounded `du -sk` and reported as reclaimed space in the receipt. Archives, LLM weights, databases, project data, installed runtimes, and active virtualenvs are never touched.
 
-The second prompt is `WORKSTATION CACHE CLEANUP?`. When the user answers yes, it removes only rebuildable caches and old update leftovers:
+## Safety Coach (Shipped)
 
-```bash
-npm cache clean --force
-rm -rf ~/.npm/_npx
-pip3 cache purge
-brew cleanup -s
-timeout 20s uv cache prune
-rm -rf selected ~/.cache tool/browser-automation caches
-find ~ -xdev -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} +
-rm -rf ~/.codex/.tmp/plugins ~/.codex/.tmp/plugins.sha
-sudo remove disabled snap revisions
-sudo journalctl --vacuum-size=512M
-```
+Safety Coach Mode runs after updates (unless `--no-security-scan` or `UPDATE_ALL_SECURITY_SCAN=0`):
 
-Do not delete archives, LLM weights, databases, project data, installed runtimes, or active virtualenvs from this cleanup path.
+- **OSV.dev package audit (`scan_osv_packages`):** Queries `https://api.osv.dev/v1/querybatch` with global `npm`, `uv`, `pipx`, `cargo`, and `brew` tuples — sending ONLY `(package name, ecosystem, version)`. Flags OpenSSF `MAL-*` malicious packages (`CRITICAL`) and `CRITICAL`/`HIGH` advisories (`GHSA-*`, `CVE-*`). Fails open safely (`SKIP`) when offline.
+- **Open-port & firewall audit (`scan_public_ports`):** Read-only `ss -tulnpH` / `netstat` inspection plus `ufw`/`firewalld` status check; flags non-loopback listeners (`0.0.0.0`, `::`, LAN) with plain-English bind descriptions.
+- **Homebrew tap trust (`inspect_brew_tap_trust` / `show_brew_tap_trust_preflight`):** Cached `brew tap-info` check with plain-English `INSIGHT` panels for `Untrusted` taps.
+- **Guided post-receipt walkthrough (`run_safety_coach_remedy`):** Displays `◆ SAFETY COACH — ISSUES FOUND (N)` and offers `[1]` recommended fix, `[2]` alternate/inspect, `[3]` skip, `[q]` exit. Never auto-deletes packages or edits firewall rules — even under `--all`. Rejects shell metacharacters before executing any remedy command.
 
 ## Sudo And Secret Boundary
 
-- `update-all` stores no sudo password, token, API key, or private value in the
-  repository.
-- If `UPDATE_ALL_SUDO_SECRET_KEY` is set, the external `secret` helper value is
-  passed to `sudo -S` through stdin and the prompt is blanked; the value is not
-  printed by update-all.
-- All streamed command output passes through redaction for common OpenAI,
-  GitHub, Slack, AWS, private-key-header, and `TOKEN=value` / `PASSWORD=value`
-  shapes before printing.
-- Compound shell commands remove `BASH_ENV`/`ENV` and use
-  `bash --noprofile --norc`; do not replace this with `bash -lc`.
-- This redaction is a guardrail, not a reason to store raw secrets in shell
-  profiles or committed files.
-
-## Safety Coach Scope
-
-Safety Coach Mode is planned, not shipped.
-
-One narrow slice is now shipped for Homebrew taps: before `brew update`,
-`update-all` checks `brew tap-info` for Homebrew's `Untrusted` marker, explains
-that this is a trust/provenance warning rather than proof of malware or an
-expired-license problem, gives the gold-standard recommendation, shows the
-exact `brew untap ...` command, and asks before untapping anything.
-
-It should:
-
-- Pull package descriptions from trusted package-manager/registry metadata.
-- Use trusted advisory sources such as registry deprecation flags, audit commands,
-  and OSV-style vulnerability databases.
-- Flag deprecated, removed, suspicious, or advisory-hit packages.
-- Ask before touching OpenClaw, Hermes, agent runtimes, or project directories.
-- Queue possible removals for a final opt-in review.
-- Show the exact command before deleting anything.
-- Never auto-delete because a warning appeared.
+- Zero stored passwords, tokens, API keys, or private machine paths in the repository.
+- Optional `UPDATE_ALL_SUDO_SECRET_KEY` passes external `secret` helper output via stdin to `sudo -S -p ''` without echoing it.
+- All streamed output passes through `redact_secrets` for OpenAI, GitHub, Slack, AWS, private-key-header, and `TOKEN=`/`PASSWORD=` shapes.
+- Internal compound shell commands run via `env -u BASH_ENV -u ENV bash --noprofile --norc -c ...`.
 
 ## Verification Commands
 
-Run these before commit/push:
+Run before committing/pushing:
 
 ```bash
-bash -n bin/update-all
-bash -n install.sh
+bash -n bin/update-all lib/*.sh install.sh scripts/build-standalone.sh
+shellcheck bin/update-all lib/*.sh install.sh scripts/build-standalone.sh tests/test-output-format.sh
 bash tests/test-output-format.sh
+./scripts/build-standalone.sh
 ./bin/update-all --help
 ./bin/update-all --dry-run --no-anim --no-color
 cspell README.md bin/update-all install.sh docs/UPDATE_ALL_HANDOFF.md cspell.json tests/test-output-format.sh CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md .github/*.md .github/*.yml .github/**/*.md .github/**/*.yml
 git diff --check
 ```
 
-Also verify the installed command path when changing install-facing behavior:
-
-```bash
-bash -n ~/.local/bin/update-all
-update-all --dry-run --no-anim --no-color
-```
-
 ## Known Limits
 
-- Terminal font size cannot be changed per line from Bash; “bigger” means bold,
-  uppercase, spacing, symbols, and stronger colors.
-- Animated bars and spinner effects only show in live interactive TTY runs.
-- `--no-anim` and dry-run intentionally suppress animations.
-- Full malicious-package discovery is not safe to bolt on without a proper
-  Safety Coach design and trusted-source policy.
+- Terminal font size cannot be changed per line from Bash; visual hierarchy comes from bold, uppercase, spacing, monochrome Unicode glyphs, and 256-color contrast.
+- Anchored DECSTBM dock and kinetic watcher only activate in live interactive TTY runs on Bash 4+ (`--no-anim`, `--bar=off`, CI, and `--dry-run` disable them cleanly).
+- OSV package scanning requires network reachability to `api.osv.dev` and skips safely when offline.

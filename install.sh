@@ -10,3 +10,4 @@ chmod +x "$repo_dir/bin/update-all"
 
 printf 'Installed update-all -> %s\n' "$target"
 printf 'Try: update-all --dry-run\n'
+printf 'Full unattended safe sweep: update-all --all\n'

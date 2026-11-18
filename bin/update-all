@@ -1,70 +1,234 @@
 #!/usr/bin/env bash
-# Local-first updater for Linux developer workstations.
+# Universal, local-first Linux workstation updater with live TUI dock and Safety Coach.
 # Public-safe: no secrets are stored here; an optional `secret` helper may supply
 # sudo only when it already exists on the host.
 set -uo pipefail
 
+# ---------------------------------------------------------------------------
+# Global configuration & defaults
+# ---------------------------------------------------------------------------
 UPDATE_ALL_COREPACK_TIMEOUT="${UPDATE_ALL_COREPACK_TIMEOUT:-90s}"
 UPDATE_ALL_NODE_TIMEOUT="${UPDATE_ALL_NODE_TIMEOUT:-300s}"
+UPDATE_ALL_PROBE_TIMEOUT="${UPDATE_ALL_PROBE_TIMEOUT:-15s}"
+UPDATE_ALL_STEP_TIMEOUT="${UPDATE_ALL_STEP_TIMEOUT:-600s}"
+UPDATE_ALL_BUILD_TIMEOUT="${UPDATE_ALL_BUILD_TIMEOUT:-1200s}"
 UPDATE_ALL_ANIM="${UPDATE_ALL_ANIM:-1}"
 UPDATE_ALL_COLOR="${UPDATE_ALL_COLOR:-1}"
+UPDATE_ALL_WATCHER="${UPDATE_ALL_WATCHER:-hybrid}"
+UPDATE_ALL_BAR="${UPDATE_ALL_BAR:-bottom}"
+UPDATE_ALL_SECURITY_SCAN="${UPDATE_ALL_SECURITY_SCAN:-1}"
+UPDATE_ALL_NONINTERACTIVE="${UPDATE_ALL_NONINTERACTIVE:-0}"
 UPDATE_ALL_DRY_RUN=0
+UPDATE_ALL_FIRMWARE_FLAG=0
+UPDATE_ALL_TIMINGS_FILE="${UPDATE_ALL_TIMINGS_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/update-all/timings.tsv}"
 
+# ---------------------------------------------------------------------------
+# Runtime state & shared tracking arrays
+# ---------------------------------------------------------------------------
 rc=0
 _ua_started_s=""
 _ua_started_h=""
 _ua_ended_s=""
 _ua_elapsed=""
+_ua_tmp_dir=""
+_ua_active_cmd_pid=""
+_ua_active_filter_pid=""
 _ua_sudo_keepalive_pid=""
 _ua_sudo_keepalive_stopped=0
-_ua_prev_int_trap=""
-_ua_prev_term_trap=""
+_ua_exiting=0
+_ua_has_timeout_k=0
+_ua_has_stdbuf=0
+
+_ua_term_rows=24
+_ua_term_cols=80
+_ua_tui_active=0
+_ua_tui_resized=0
+_ua_tui_compact=0
+_ua_utf8=1
+
+_ua_step_index=0
+_ua_step_total=0
+_ua_phase_name="PREFLIGHT"
+_ua_current_step_key=""
+_ua_current_step_label=""
+_ua_current_step_start_s=0
+_ua_total_est_secs=0
+_ua_done_est_secs=0
+
+_ua_count_updated=0
+_ua_count_ok=0
+_ua_count_unchanged=0
+_ua_count_skipped=0
+_ua_count_failed=0
+_ua_count_security=0
+_ua_reclaimed_kb=0
+
 _ua_firmware_choice="no"
 _ua_apt_cleanup_choice="no"
 _ua_workstation_cleanup_choice="no"
 _ua_answer_all_choice="no"
+
+_ua_distro_id=""
+_ua_distro_like=""
+_ua_distro_name=""
+_ua_sys_pkg_mgr="none"
+_ua_has_systemd=0
+_ua_is_headless=0
+_ua_needs_sudo=0
+
+# Discovered tool flags
+_ua_has_apt=0
+_ua_has_rpm_ostree=0
+_ua_has_dnf=0
+_ua_has_pacman=0
+_ua_has_zypper=0
+_ua_has_apk=0
+_ua_has_xbps=0
+_ua_has_snap=0
+_ua_has_flatpak=0
+_ua_has_fwupd=0
+_ua_has_node=0
+_ua_has_update_node=0
+_ua_has_mise=0
+_ua_has_volta=0
+_ua_has_fnm=0
+_ua_has_corepack=0
+_ua_has_pnpm=0
+_ua_has_yarn=0
+_ua_has_bun=0
+_ua_has_deno=0
+_ua_has_npm=0
+_ua_has_claude=0
+_ua_has_codex=0
+_ua_has_brew=0
+_ua_has_uv=0
+_ua_has_pipx=0
+_ua_has_rustup=0
+_ua_has_cargo=0
+_ua_has_gh=0
+_ua_has_code=0
+_ua_has_codium=0
+_ua_has_code_insiders=0
 
 declare -a _ua_labels=()
 declare -a _ua_stats=()
 declare -a _ua_before=()
 declare -a _ua_after=()
 declare -a _ua_notes=()
+
+declare -a _ua_delta_pkgs=()
+declare -a _ua_delta_before=()
+declare -a _ua_delta_after=()
+declare -a _ua_delta_via=()
+
 declare -a _ua_concern_titles=()
 declare -a _ua_concern_notes=()
 declare -a _ua_concern_actions=()
+
 declare -a _ua_brew_taps=()
 declare -a _ua_brew_sources=()
 declare -a _ua_brew_installed=()
 declare -a _ua_brew_untap_choices=()
+_ua_brew_trust_inspected=0
 
+declare -a _ua_sec_kind=()
+declare -a _ua_sec_sev=()
+declare -a _ua_sec_target=()
+declare -a _ua_sec_id=()
+declare -a _ua_sec_summary=()
+declare -a _ua_sec_remedy_desc=()
+declare -a _ua_sec_remedy_cmd=()
+declare -a _ua_sec_alt_cmd=()
+
+declare -a _ua_timing_keys=()
+declare -a _ua_timing_secs=()
+declare -a _ua_planned_keys=()
+declare -a _ua_run_timing_keys=()
+declare -a _ua_run_timing_secs=()
+
+# ---------------------------------------------------------------------------
+# Module loader (skipped automatically in standalone bundled builds)
+# ---------------------------------------------------------------------------
+_ua_resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}" dir target
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    target="$(readlink "$src")"
+    case "$target" in
+      /*) src="$target" ;;
+      *)  src="$dir/$target" ;;
+    esac
+  done
+  cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd
+}
+
+if [ "${_UA_BUNDLED:-0}" != 1 ]; then
+  _ua_bin_dir="$(_ua_resolve_script_dir)"
+  _ua_lib_dir="${_ua_bin_dir}/../lib"
+  for _ua_mod in \
+    colors_and_glyphs.sh \
+    tui.sh \
+    runner.sh \
+    discover.sh \
+    updaters.sh \
+    cleanup.sh \
+    safety_coach.sh \
+    receipt.sh; do
+    if [ ! -r "$_ua_lib_dir/$_ua_mod" ]; then
+      printf 'update-all: missing module %s\n' "$_ua_lib_dir/$_ua_mod" >&2
+      exit 1
+    fi
+    # shellcheck source=/dev/null
+    . "$_ua_lib_dir/$_ua_mod"
+  done
+  unset _ua_bin_dir _ua_lib_dir _ua_mod
+fi
+
+# ---------------------------------------------------------------------------
+# CLI usage & argument parsing
+# ---------------------------------------------------------------------------
 usage() {
   cat <<'EOF'
-update-all - local workstation updater
+update-all - universal local-first Linux workstation updater
 
 Usage:
-  update-all [--dry-run] [--no-anim] [--no-color] [-a|--all] [-h|--help]
+  update-all [options]
 
 Options:
-  --dry-run   Print each update command instead of running it.
-  --no-anim   Disable terminal animations.
-  --no-color  Disable ANSI colors.
-  -a, --all   Answer yes to all optional prompts in this run.
-  -h, --help  Show this help.
+  --dry-run                    Print each update command without applying updates.
+  -a, --all                    Auto-approve all safe updates & cache cleanup (zero upfront prompts).
+                               Firmware flashing remains opt-in (--firmware); Safety Coach findings
+                               still show an interactive remedy walkthrough at the end.
+  --firmware                   Opt in to applying installable Linux firmware updates (fwupdmgr).
+  --no-anim                    Disable live watcher animations and pinned TUI bar.
+  --no-color                   Disable ANSI color output (also honors NO_COLOR).
+  --no-security-scan           Skip OSV malicious/advisory and open-port Safety Coach scans.
+  --non-interactive            Never prompt for keyboard input (print actionable remedies instead).
+  --watcher=MODE               Live watcher style: hybrid (default), braille, or anthropic.
+  --bar=POS                    Persistent TUI progress bar: bottom (default), top, or off.
+  -h, --help                   Show this help.
 
 Interactive:
   At optional live prompts, type a or all once to answer yes to every remaining
-  optional question in that run, or use -a/--all from the command line.
+  safe cleanup question in that run, or pass -a/--all from the command line.
 
 Environment:
+  UPDATE_ALL_PROBE_TIMEOUT=15s     Timeout for version & preflight probes.
   UPDATE_ALL_COREPACK_TIMEOUT=90s  Timeout for corepack commands.
   UPDATE_ALL_NODE_TIMEOUT=300s     Timeout for update-node.
-  UPDATE_ALL_ANIM=0               Disable animations.
-  UPDATE_ALL_COLOR=0              Disable colors.
-  UPDATE_ALL_SUDO_SECRET_KEY=name Optional `secret` helper key for sudo.
+  UPDATE_ALL_STEP_TIMEOUT=600s     Default timeout for package manager updates.
+  UPDATE_ALL_BUILD_TIMEOUT=1200s   Timeout for source builds (e.g. cargo).
+  UPDATE_ALL_WATCHER=hybrid        Watcher style: hybrid | braille | anthropic.
+  UPDATE_ALL_BAR=bottom            Dock bar position: bottom | top | off.
+  UPDATE_ALL_ANIM=0                Disable terminal animations.
+  UPDATE_ALL_COLOR=0               Disable ANSI colors.
+  UPDATE_ALL_SECURITY_SCAN=0       Disable Safety Coach scans.
+  UPDATE_ALL_SUDO_SECRET_KEY=name  Optional `secret` helper key for sudo.
 EOF
 }
 
 parse_args() {
+  local val
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run)
@@ -73,11 +237,43 @@ parse_args() {
       -a|--all)
         _ua_answer_all_choice="yes"
         ;;
+      --firmware)
+        UPDATE_ALL_FIRMWARE_FLAG=1
+        _ua_firmware_choice="yes"
+        ;;
       --no-anim)
         UPDATE_ALL_ANIM=0
         ;;
       --no-color)
         UPDATE_ALL_COLOR=0
+        ;;
+      --no-security-scan)
+        UPDATE_ALL_SECURITY_SCAN=0
+        ;;
+      --non-interactive)
+        UPDATE_ALL_NONINTERACTIVE=1
+        ;;
+      --watcher=*)
+        val="${1#--watcher=}"
+        case "$val" in
+          hybrid|braille|anthropic) UPDATE_ALL_WATCHER="$val" ;;
+          *)
+            printf 'update-all: invalid --watcher value: %s (expected hybrid, braille, or anthropic)\n\n' "$val" >&2
+            usage >&2
+            exit 2
+            ;;
+        esac
+        ;;
+      --bar=*)
+        val="${1#--bar=}"
+        case "$val" in
+          bottom|top|off) UPDATE_ALL_BAR="$val" ;;
+          *)
+            printf 'update-all: invalid --bar value: %s (expected bottom, top, or off)\n\n' "$val" >&2
+            usage >&2
+            exit 2
+            ;;
+        esac
         ;;
       --help|-h)
         usage
@@ -93,2227 +289,15 @@ parse_args() {
   done
 }
 
-color_init() {
-  local ncolors=0
-  if [ "$UPDATE_ALL_COLOR" = 1 ] && [ -t 1 ] && command -v tput >/dev/null 2>&1; then
-    ncolors="$(tput colors 2>/dev/null || echo 0)"
-  fi
-
-  if [ "${ncolors:-0}" -ge 256 ]; then
-    C_RESET="$(tput sgr0)"
-    C_OK="$(tput setaf 35)"
-    C_WARN="$(tput setaf 214)"
-    C_BAD="$(tput setaf 203)"
-    C_CMD="$(tput setaf 222)"
-    C_TIP="$(tput setaf 245)"
-    C_HEADER="$(tput bold)$(tput setaf 231)"
-    C_LABEL="$(tput setaf 222)"
-    C_FRAME="$(tput setaf 240)"
-    C_ORANGE="$(tput bold)$(tput setaf 214)"
-    C_UNIT="$(tput bold)$(tput setaf 215)"
-    C_NEON="$C_ORANGE"
-    C_PURPOSE="$(tput setaf 109)"
-    C_VERSION_LABEL="$(tput setaf 250)"
-    C_VERSION_BEFORE_LABEL="$(tput setaf 66)"
-    C_VERSION_AFTER_LABEL="$(tput setaf 109)"
-    C_VERSION_BEFORE="$(tput bold)$(tput setaf 159)"
-    C_VERSION_AFTER="$(tput bold)$(tput setaf 121)"
-    C_PATH="$(tput setaf 110)"
-    C_RESULT="$(tput setaf 179)"
-    C_LOG="$(tput setaf 244)"
-    C_APT_SOURCE="$(tput setaf 67)"
-    C_APT_PROGRESS="$(tput setaf 215)"
-    C_BINARY="$(tput setaf 30)"
-    C_CLEANUP_WORD="$(tput setaf 230)"
-    C_CLEANUP_PUNCT="$(tput setaf 223)"
-  elif [ "${ncolors:-0}" -ge 8 ]; then
-    C_RESET="$(tput sgr0)"
-    C_OK="$(tput setaf 2)"
-    C_WARN="$(tput setaf 3)"
-    C_BAD="$(tput setaf 1)"
-    C_CMD="$(tput setaf 3)"
-    C_TIP="$(tput dim)"
-    C_HEADER="$(tput bold)"
-    C_LABEL="$(tput setaf 3)"
-    C_FRAME="$(tput dim)"
-    C_ORANGE="$(tput bold)$(tput setaf 3)"
-    C_UNIT="$C_ORANGE"
-    C_NEON="$C_ORANGE"
-    C_PURPOSE="$(tput setaf 6)"
-    C_VERSION_LABEL="$(tput bold)$(tput setaf 6)"
-    C_VERSION_BEFORE_LABEL="$(tput setaf 6)"
-    C_VERSION_AFTER_LABEL="$(tput bold)$(tput setaf 6)"
-    C_VERSION_BEFORE="$(tput bold)$(tput setaf 3)"
-    C_VERSION_AFTER="$(tput bold)$(tput setaf 2)"
-    C_PATH="$(tput setaf 6)"
-    C_RESULT="$(tput setaf 5)"
-    C_LOG="$(tput dim)"
-    C_APT_SOURCE="$(tput setaf 6)"
-    C_APT_PROGRESS="$(tput setaf 3)"
-    C_BINARY="$(tput setaf 6)"
-    C_CLEANUP_WORD="$(tput setaf 3)"
-    C_CLEANUP_PUNCT="$(tput dim)$(tput setaf 3)"
-  else
-    C_RESET=""; C_OK=""; C_WARN=""; C_BAD=""
-    C_CMD=""; C_TIP=""; C_HEADER=""; C_LABEL=""; C_FRAME=""
-    C_ORANGE=""; C_NEON=""; C_UNIT=""; C_PURPOSE=""
-    C_VERSION_LABEL=""; C_VERSION_BEFORE_LABEL=""; C_VERSION_AFTER_LABEL=""
-    C_VERSION_BEFORE=""; C_VERSION_AFTER=""; C_PATH=""; C_RESULT=""; C_LOG=""
-    C_APT_SOURCE=""; C_APT_PROGRESS=""; C_BINARY=""
-    C_CLEANUP_WORD=""
-    C_CLEANUP_PUNCT=""
-  fi
-}
-
-anim_enabled() {
-  [ "$UPDATE_ALL_ANIM" = 1 ] || return 1
-  [ "$UPDATE_ALL_DRY_RUN" = 0 ] || return 1
-  [ -t 1 ] || return 1
-  [ "${CI:-}" != "true" ] || return 1
-  [ "${TERM:-}" != "dumb" ] || return 1
-}
-
-sleep_tick() {
-  sleep "${1:-0.03}" 2>/dev/null || true
-}
-
-scan_line() {
-  local label="$1" width="${2:-69}" i bar
-  if ! anim_enabled; then
-    printf '%b>>%b %s\n' "$C_HEADER" "$C_RESET" "$label"
-    return 0
-  fi
-
-  for ((i = 0; i <= width; i++)); do
-    bar="$(printf '%*s' "$i" '' | tr ' ' '#')"
-    bar="${bar}$(printf '%*s' "$((width - i))" '' | tr ' ' '.')"
-    printf '\r%b[%-*s]%b %b%s%b' "$C_NEON" "$width" "$bar" "$C_RESET" "$C_HEADER" "$label" "$C_RESET"
-    sleep_tick 0.015
-  done
-  printf '\n'
-}
-
-title_spin() {
-  local label="$1" frames="|/-\\" i frame
-  if ! anim_enabled; then
-    printf '\n%b== %s ==%b\n' "$C_HEADER" "$label" "$C_RESET"
-    return 0
-  fi
-
-  for ((i = 0; i < 14; i++)); do
-    frame="${frames:i % 4:1}"
-    printf '\r%b[%s]%b %b%s%b %bONLINE%b' "$C_ORANGE" "$frame" "$C_RESET" "$C_HEADER" "$label" "$C_RESET" "$C_NEON" "$C_RESET"
-    sleep_tick 0.04
-  done
-  printf '\r%b[+]%b %b%s%b %bONLINE%b    \n' "$C_ORANGE" "$C_RESET" "$C_HEADER" "$label" "$C_RESET" "$C_NEON" "$C_RESET"
-}
-
-intro() {
-  local update_binary all_binary divider_padding
-
-  printf '\n'
-  printf '%b ██╗   ██╗██████╗ ██████╗  █████╗ ████████╗███████╗      █████╗ ██╗     ██╗     %b\n' "$C_ORANGE" "$C_RESET"
-  printf '%b ██║   ██║██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔════╝     ██╔══██╗██║     ██║     %b\n' "$C_ORANGE" "$C_RESET"
-  printf '%b ██║   ██║██████╔╝██║  ██║███████║   ██║   █████╗       ███████║██║     ██║     %b\n' "$C_ORANGE" "$C_RESET"
-  printf '%b ██║   ██║██╔═══╝ ██║  ██║██╔══██║   ██║   ██╔══╝       ██╔══██║██║     ██║     %b\n' "$C_ORANGE" "$C_RESET"
-  printf '%b ╚██████╔╝██║     ██████╔╝██║  ██║   ██║   ███████╗     ██║  ██║███████╗███████╗%b\n' "$C_ORANGE" "$C_RESET"
-  printf '%b  ╚═════╝ ╚═╝     ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝     ╚═╝  ╚═╝╚══════╝╚══════╝%b\n' "$C_ORANGE" "$C_RESET"
-
-  update_binary='01110101  01110000  01100100  01100001  01110100  01100101'
-  all_binary='01100001  01101100  01101100'
-  divider_padding=$(( (${#update_binary} - ${#all_binary}) / 2 ))
-
-  printf '      %b%s%b\n' "$C_BINARY" "$update_binary" "$C_RESET"
-  printf '%*s%b%s%b\n' "$((6 + divider_padding))" '' "$C_BINARY" "$all_binary" "$C_RESET"
-  printf '\n'
-}
-
-banner_spin_3d() {
-  local label="$1" heading i frame
-  anim_enabled || return 0
-  heading="$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]')"
-
-  for ((i = 0; i < 10; i++)); do
-    case "$((i % 5))" in
-      0) frame="╭──[ ${heading} ]──╮" ;;
-      1) frame="╱   ${heading}   ╲" ;;
-      2) frame="═╡  ${heading}  ╞═" ;;
-      3) frame="╲   ${heading}   ╱" ;;
-      *) frame="╰──[ ${heading} ]──╯" ;;
-    esac
-    printf '\r%b%s%b' "$C_UNIT" "$frame" "$C_RESET"
-    sleep_tick 0.045
-  done
-  printf '\r%*s\r' 80 ''
-}
-
-banner() {
-  local label="$1"
-  banner_spin_3d "$label"
-  printf '\n'
-  if command -v figlet >/dev/null 2>&1 && figlet -f future "$label" 2>/dev/null | while IFS= read -r line; do
-    printf '%b%s%b\n' "$C_HEADER" "$line" "$C_RESET"
-  done; then
-    :
-  elif command -v figlet >/dev/null 2>&1 && figlet -f pagga "$label" 2>/dev/null | while IFS= read -r line; do
-    printf '%b%s%b\n' "$C_HEADER" "$line" "$C_RESET"
-  done; then
-    :
-  else
-    printf '%b── %s %b\n' "$C_FRAME" "$label" "$C_RESET"
-  fi
-}
-
-styled_package_name() {
-  local name="$1" width="${2:-0}" color
-  color="$(styled_package_color "$name")"
-
-  if [ "${width:-0}" -gt 0 ]; then
-    printf '%b%-*s%b' "$color" "$width" "$name" "$C_RESET"
-  else
-    printf '%b%s%b' "$color" "$name" "$C_RESET"
-  fi
-}
-
-package_color_hash() {
-  local key="$1" i char len hash=0
-  len="${#key}"
-  for ((i = 0; i < len; i++)); do
-    char="$(printf '%d' "'${key:i:1}")"
-    hash=$(( (hash * 33 + char) & 0x7fffffff ))
-  done
-  printf '%s' "$((hash % 7))"
-}
-
-styled_package_color() {
-  local style_key
-  style_key="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-
-  case "$style_key" in
-    apt)
-      printf '%s' "$C_ORANGE" ;;
-    brew)
-      printf '%s' "$C_NEON" ;;
-    node)
-      printf '%s' "$C_PATH" ;;
-    corepack)
-      printf '%s' "$C_APT_PROGRESS" ;;
-    pnpm)
-      printf '%s' "$C_RESULT" ;;
-    *npm*)
-      printf '%s' "$C_VERSION_AFTER" ;;
-    yarn)
-      printf '%s' "$C_PURPOSE" ;;
-    uv)
-      printf '%s' "$C_LABEL" ;;
-    pipx)
-      printf '%s' "$C_APT_PROGRESS" ;;
-    rustup|cargo)
-      printf '%s' "$C_RESULT" ;;
-    gh)
-      printf '%s' "$C_WARN" ;;
-    dpkg|snap|flatpak|codex|claude)
-      printf '%s' "$C_VERSION_BEFORE" ;;
-    cleanup|cache|trash) printf '%s' "$C_CLEANUP_WORD" ;;
-    *)
-      case "$(package_color_hash "$style_key")" in
-        0) printf '%s' "$C_VERSION_LABEL" ;;
-        1) printf '%s' "$C_PURPOSE" ;;
-        2) printf '%s' "$C_PATH" ;;
-        3) printf '%s' "$C_RESULT" ;;
-        4) printf '%s' "$C_APT_PROGRESS" ;;
-        5) printf '%s' "$C_NEON" ;;
-        *) printf '%s' "$C_WARN" ;;
-      esac
-      ;;
-  esac
-}
-
-section() {
-  local label="$1" heading
-  heading="$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]')"
-  printf '\n'
-  printf '%b╾────%b %b%s%b %b────╼%b\n' "$C_FRAME" "$C_RESET" "$C_UNIT" "$heading" "$C_RESET" "$C_FRAME" "$C_RESET"
-  printf '\n'
-  scene_strip "$label"
-}
-
-scene_strip() {
-  local label="$1" manager action i fill empty
-  anim_enabled || return 0
-
-  case "$label" in
-    *apt*update*) manager="apt"; action="fetch indexes" ;;
-    *apt*upgrade*) manager="apt"; action="resolve packages" ;;
-    *snap*) manager="snap"; action="refresh apps" ;;
-    *node*) manager="node"; action="check runtime" ;;
-    *corepack*) manager="corepack"; action="wire shims" ;;
-    *pnpm*) manager="pnpm"; action="activate latest" ;;
-    *yarn*) manager="yarn"; action="activate stable" ;;
-    *bun*) manager="bun"; action="upgrade runtime" ;;
-    *npm*self*) manager="npm"; action="self update" ;;
-    *npm*globals*) manager="npm"; action="global package graph" ;;
-    *claude*) manager="npm"; action="claude code" ;;
-    *codex*) manager="npm"; action="codex cli" ;;
-    *brew*) manager="brew"; action="cellar sweep" ;;
-    *uv*) manager="uv"; action="toolchain sweep" ;;
-    *pipx*) manager="pipx"; action="isolated CLIs" ;;
-    *rustup*) manager="rustup"; action="toolchains" ;;
-    *cargo*) manager="cargo"; action="installed CLIs" ;;
-    *gh*) manager="gh"; action="extensions" ;;
-    *code*|*codium*) manager="code"; action="editor extensions" ;;
-    *firmware*|*fwupd*) manager="fwupd"; action="firmware check" ;;
-    *workstation*cleanup*|*cache*cleanup*) manager="cache"; action="safe cache sweep" ;;
-    *clean*) manager="apt"; action="cleanup gate" ;;
-    *) manager="sys"; action="inspect" ;;
-  esac
-
-  for ((i = 0; i <= 45; i += 3)); do
-    fill="$(printf '%*s' "$i" '')"
-    empty="$(printf '%*s' "$((45 - i))" '')"
-    fill="${fill// /▓}"
-    empty="${empty// /░}"
-    printf '\r   %s [%b%s%s%b] %b%s%b' "$(styled_package_name "$manager" 9)" "$C_NEON" "$fill" "$empty" "$C_RESET" "$C_TIP" "$action" "$C_RESET"
-    sleep_tick 0.035
-  done
-  printf '\n'
-}
-
-run_bounded() {
-  local limit="$1"
-  shift
-  local code
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$limit" "$@" </dev/null 2>&1 | color_log_stream
-    code=${PIPESTATUS[0]}
-  else
-    "$@" </dev/null 2>&1 | color_log_stream
-    code=${PIPESTATUS[0]}
-  fi
-  return "$code"
-}
-
-show_cmd() {
-  printf '%b$%b' "$C_CMD" "$C_RESET"
-  printf ' %q' "$@"
-  printf '\n'
-}
-
-run_cmd() {
-  local code
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd "$@"
-    return 0
-  fi
-  "$@" </dev/null 2>&1 | color_log_stream
-  code=${PIPESTATUS[0]}
-  return "$code"
-}
-
-run_cmd_capture() {
-  local __var="$1" output code
-  shift
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd "$@"
-    printf -v "$__var" '%s' ''
-    return 0
-  fi
-  output="$("$@" </dev/null 2>&1)"
-  code=$?
-  printf '%s\n' "$output" | color_log_stream
-  printf -v "$__var" '%s' "$output"
-  return "$code"
-}
-
-run_cmd_capture_quiet() {
-  local __var="$1" output code
-  shift
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd "$@"
-    printf -v "$__var" '%s' ''
-    return 0
-  fi
-  output="$("$@" </dev/null 2>&1)"
-  code=$?
-  printf -v "$__var" '%s' "$output"
-  return "$code"
-}
-
-run_shell() {
-  local script="$1" code
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd env -u BASH_ENV -u ENV bash --noprofile --norc -c "$script"
-    return 0
-  fi
-  env -u BASH_ENV -u ENV bash --noprofile --norc -c "$script" </dev/null 2>&1 | color_log_stream
-  code=${PIPESTATUS[0]}
-  return "$code"
-}
-
-run_shell_capture() {
-  local __var="$1" script="$2" output code
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd env -u BASH_ENV -u ENV bash --noprofile --norc -c "$script"
-    printf -v "$__var" '%s' ''
-    return 0
-  fi
-  output="$(env -u BASH_ENV -u ENV bash --noprofile --norc -c "$script" </dev/null 2>&1)"
-  code=$?
-  printf '%s\n' "$output" | color_log_stream
-  printf -v "$__var" '%s' "$output"
-  return "$code"
-}
-
-sudo_secret_available() {
-  [ -n "${UPDATE_ALL_SUDO_SECRET_KEY:-}" ] || return 1
-  command -v secret >/dev/null 2>&1 || return 1
-  secret has "$UPDATE_ALL_SUDO_SECRET_KEY" 2>/dev/null
-}
-
-sudo_cmd() {
-  local code
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd sudo "$@"
-    return 0
-  fi
-
-  if ! command -v sudo >/dev/null 2>&1; then
-    "$@" 2>&1 | color_log_stream
-    code=${PIPESTATUS[0]}
-    return "$code"
-  fi
-  if sudo_secret_available; then
-    secret get "$UPDATE_ALL_SUDO_SECRET_KEY" 2>/dev/null | sudo -S -p '' "$@" 2>&1 | color_log_stream
-    code=${PIPESTATUS[1]}
-    return "$code"
-  fi
-  if sudo -n true 2>/dev/null; then
-    sudo "$@" 2>&1 | color_log_stream
-    code=${PIPESTATUS[0]}
-    return "$code"
-  fi
-  sudo "$@" 2>&1 | color_log_stream
-  code=${PIPESTATUS[0]}
-  return "$code"
-}
-
-color_log_stream() {
-  local line lower
-  tr -d '\000' | while IFS= read -r line || [ -n "$line" ]; do
-    line="${line//^@/}"
-    line="$(redact_secrets "$line")"
-    lower="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
-    if [ -z "$line" ]; then
-      printf '\n'
-      continue
-    fi
-    case "$lower" in
-      *error*|*failed*|*fatal*|e:\ *|*cannot\ *|*not\ found*)
-        printf '%b%s%b\n' "$C_BAD" "$line" "$C_RESET"
-        ;;
-      *warn*|*deprecated*|*audit*|*vulnerab*|*notice*|*held\ back*)
-        printf '%b%s%b\n' "$C_WARN" "$line" "$C_RESET"
-        ;;
-      *added*|*changed*|*updated*|*upgraded*|*installed*|*success*|*done*|*already\ up\ to\ date*)
-        printf '%b%s%b\n' "$C_OK" "$line" "$C_RESET"
-        ;;
-      *removed*|*removing*|*autoremove*|*prune*|*cleanup*)
-        printf '%b%s%b\n' "$C_TIP" "$line" "$C_RESET"
-        ;;
-      *fund*|*donation*)
-        printf '%b%s%b\n' "$C_TIP" "$line" "$C_RESET"
-        ;;
-      preparing\ *@*\ for\ immediate\ activation*)
-        printf '%b%s%b\n' "$C_APT_PROGRESS" "$line" "$C_RESET"
-        ;;
-      *@anthropic-ai/claude-code*|*@openai/codex*|*pnpm@*|*npm@*|*yarn@*)
-        printf '%b%s%b\n' "$C_HEADER" "$line" "$C_RESET"
-        ;;
-      fetched\ *|reading\ package\ lists*|building\ dependency\ tree*|reading\ state\ information*)
-        printf '%b%s%b\n' "$C_APT_PROGRESS" "$line" "$C_RESET"
-        ;;
-      hit:*|get:*|ign:*)
-        printf '%b%s%b\n' "$C_APT_SOURCE" "$line" "$C_RESET"
-        ;;
-      *)
-        printf '%b%s%b\n' "$C_LOG" "$line" "$C_RESET"
-        ;;
-    esac
-  done
-}
-
-redact_secrets() {
-  printf '%s' "$1" | sed -E \
-    -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED_OPENAI_KEY]/g' \
-    -e 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED_GITHUB_TOKEN]/g' \
-    -e 's/gh[pousr]_[A-Za-z0-9_]{20,}/[REDACTED_GITHUB_TOKEN]/g' \
-    -e 's/xox[baprs]-[A-Za-z0-9-]{20,}/[REDACTED_SLACK_TOKEN]/g' \
-    -e 's/AKIA[0-9A-Z]{16}/[REDACTED_AWS_ACCESS_KEY]/g' \
-    -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED_PRIVATE_KEY_BEGIN]/g' \
-    -e 's/([A-Za-z_][A-Za-z0-9_]*(TOKEN|PASSWORD|PASS|SECRET|API_KEY|APIKEY|ACCESS_KEY)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*)[^[:space:]\[]+/\1[REDACTED]/g'
-}
-
-describe_tool() {
-  case "$1" in
-    dpkg) printf 'Debian package database integrity check; catches interrupted installs before apt runs.' ;;
-    apt) printf 'Ubuntu/Debian system package manager; updates OS packages and security fixes.' ;;
-    snap) printf 'Canonical app package system; refreshes installed snap applications.' ;;
-    flatpak) printf 'Sandboxed desktop app package system; updates installed Flatpak apps.' ;;
-    node) printf 'JavaScript runtime used by npm, Codex, Claude Code, and many developer CLIs.' ;;
-    corepack) printf 'Node-shipped package-manager shim that activates pnpm/yarn without manual installs.' ;;
-    pnpm) printf 'Fast JavaScript package manager with a content-addressable store that saves disk space across projects.' ;;
-    yarn) printf 'JavaScript dependency manager used for project installs, workspaces, lock files, and reproducible package graphs.' ;;
-    bun) printf 'JavaScript runtime, package manager, and test runner; updated with Bun'\''s first-party upgrade command.' ;;
-    npm) printf 'Default Node.js package manager; updates npm itself and globally installed JavaScript command-line tools.' ;;
-    npm-globals) printf 'Updates globally installed npm CLIs already present on PATH.' ;;
-    claude) printf 'Anthropic terminal assistant for codebase work; updated through its first-party claude update command.' ;;
-    codex) printf 'OpenAI local coding-agent CLI; updated through its first-party codex update command.' ;;
-    hermes) printf 'Skipped on purpose: active agent runtimes should not be surprise-upgraded mid-workflow.' ;;
-    brew) printf 'Homebrew package manager for Linux/macOS developer tools and formulae.' ;;
-    uv) printf 'Fast Python package and tool manager; upgraded by its owning package manager here.' ;;
-    pipx) printf 'Installs and upgrades isolated Python CLI applications.' ;;
-    rustup) printf 'Rust toolchain manager; updates rustc/cargo toolchains when installed.' ;;
-    cargo-installed) printf 'Rust command-line tools installed with cargo; updated only when the cargo-install-update helper already exists.' ;;
-    gh) printf 'GitHub official command-line tool for pull requests, issues, repositories, auth, and extensions.' ;;
-    code) printf 'Editor extensions for Visual Studio Code-compatible CLIs; updates extensions, not editor settings or projects.' ;;
-    fwupd) printf 'Linux firmware update service; checks vendor firmware updates and asks before applying them.' ;;
-    coverage) printf 'Preflight coverage map that explains what update-all will handle and what remains intentionally manual.' ;;
-    cleanup) printf 'Removes stale package-manager caches, disabled update leftovers, and known rebuildable workstation caches.' ;;
-    *) printf 'Updater step.' ;;
-  esac
-}
-
-tool_card() {
-  local key="$1" title="$2" version="${3:-}" package="${4:-}"
-  local desc heading
-  desc="$(describe_tool "$key")"
-  heading="$(printf '%s' "$title" | tr '[:lower:]' '[:upper:]')"
-  [ -n "$version" ] || version="$(version_of "$key" 2>/dev/null || true)"
-  if [ -z "$version" ]; then
-    case "$key" in
-      cleanup) version="post-update maintenance" ;;
-      *) version="not installed" ;;
-    esac
-  fi
-
-  printf '   %b▌ %s%b\n' "$C_UNIT" "$heading" "$C_RESET"
-  [ -n "$package" ] && printf '   %b%-15s%b %s\n' "$C_LABEL" "package" "$C_RESET" "$(styled_package_name "$package")"
-  version_rows "version before" "$version" "$C_VERSION_BEFORE"
-  printf '   %b%-15s%b %b%s%b\n' "$C_PURPOSE" "purpose" "$C_RESET" "$C_PURPOSE" "$desc" "$C_RESET"
-  printf '\n'
-}
-
-version_rows() {
-  local label="$1" value="${2:-}" color="$3" label_color path rest
-  label_color="$C_VERSION_LABEL"
-  case "$label" in
-    "version before") label_color="$C_VERSION_BEFORE_LABEL" ;;
-    "version after") label_color="$C_VERSION_AFTER_LABEL" ;;
-  esac
-  [ -n "$value" ] || value="-"
-  case "$value" in
-    /*)
-      path="${value%% *}"
-      rest="${value#"$path"}"
-      rest="${rest# }"
-      [ -n "$rest" ] || rest="installed"
-      if [ "$label" = "version before" ]; then
-        printf '   %b%-15s%b %b%s%b\n' "$label_color" "$label" "$C_RESET" "$color" "$rest" "$C_RESET"
-        printf '   %b%-15s%b %b%s%b\n' "$C_LABEL" "path" "$C_RESET" "$C_PATH" "$path" "$C_RESET"
-      else
-        printf '   %b%-15s%b %b%s%b\n' "$C_LABEL" "path" "$C_RESET" "$C_PATH" "$path" "$C_RESET"
-        printf '   %b%-15s%b %b%s%b\n' "$label_color" "$label" "$C_RESET" "$color" "$rest" "$C_RESET"
-      fi
-      ;;
-    *)
-      printf '   %b%-15s%b %b%s%b\n' "$label_color" "$label" "$C_RESET" "$color" "$value" "$C_RESET"
-      ;;
-  esac
-}
-
-tool_version_after() {
-  local version="${1:-}" status="${2:-OK}" color
-  [ -n "$version" ] || version="-"
-  case "$status" in
-    UPDATED|OK) color="$C_VERSION_AFTER" ;;
-    UNCHANGED|SKIP) color="$C_VERSION_AFTER" ;;
-    FAIL) color="$C_BAD" ;;
-    *) color="$C_VERSION_AFTER" ;;
-  esac
-  version_rows "version after" "$version" "$color"
-}
-
-tool_result() {
-  local status="$1" note="${2:-}" color
-  case "$status" in
-    UPDATED|OK) color="$C_OK" ;;
-    UNCHANGED|SKIP) color="$C_RESULT" ;;
-    FAIL) color="$C_BAD" ;;
-    *) color="$C_RESULT" ;;
-  esac
-  printf '   %b%-15s%b %b%s%b\n' "$C_LABEL" "result" "$C_RESET" "$color" "$status" "$C_RESET"
-  [ -z "$note" ] || printf '   %b%-15s%b %b%s%b\n' "$C_LABEL" "note" "$C_RESET" "$C_TIP" "$note" "$C_RESET"
-}
-
-pending_updates_begin() {
-  local source="$1"
-  printf '   %b%-15s%b %b%s%b\n' "$C_LABEL" "pending updates" "$C_RESET" "$C_HEADER" "$source" "$C_RESET"
-}
-
-pending_update_line() {
-  local name="$1" old="$2" new="$3"
-  printf '      %s %b%s%b %b->%b %b%s%b\n' \
-    "$(styled_package_name "$name" 30)" \
-    "$C_VERSION_BEFORE" "$old" "$C_RESET" \
-    "$C_FRAME" "$C_RESET" \
-    "$C_VERSION_AFTER" "$new" "$C_RESET"
-}
-
-pending_update_note() {
-  printf '      %b%s%b\n' "$C_TIP" "$1" "$C_RESET"
-}
-
-cleanup_question() {
-  local mode="${1:-prompt}" cleanup_indent="   " cleanup_art_color cleanup_punct_color
-  cleanup_art_color="$C_CLEANUP_WORD"
-  cleanup_punct_color="$C_ORANGE"
-  printf '\n'
-  if command -v figlet >/dev/null 2>&1; then
-    figlet -f future "APT CLEANUP?" 2>/dev/null | while IFS= read -r line; do
-      printf '%b%s%b\n' "$cleanup_art_color" "$line" "$C_RESET"
-    done
-  else
-    printf '%b%s%b\n' "$cleanup_art_color" "  ___  ___ _____   ___ _    ___   _   _  _ _   _ ___  ___" "$C_RESET"
-    printf '%b%s%b\n' "$C_CLEANUP_PUNCT" " / _ \\| _ \\_   _| / __| |  | __| /_\\ | \\| | | | | _ \\/ __|" "$C_RESET"
-    printf '%b%s%b\n' "$cleanup_art_color" "| (_) |  _/ | |  | (__| |__| _| / _ \\| .\\ | |_| |  _/\\__ \\" "$C_RESET"
-    printf '%b%s%b\n' "$C_CLEANUP_PUNCT" " \\___/|_|   |_|   \\___|____|___/_/ \\_\\_|\\_|\\___/|_|  |___/" "$C_RESET"
-  fi
-  printf '%s%bAPT%b %bCLEANUP%b%b?%b\n' \
-    "$cleanup_indent" \
-    "$cleanup_punct_color" "$C_RESET" "$cleanup_art_color" "$C_RESET" "$cleanup_punct_color" "$C_RESET"
-  printf '%s%bThis will run apt-owned cleanup only.%b\n' "$cleanup_indent" "$C_PURPOSE" "$C_RESET"
-  printf '%s%bIt may purge packages apt marks as no longer needed and clear downloaded apt caches.%b\n' "$cleanup_indent" "$C_PURPOSE" "$C_RESET"
-  printf '%s%bNothing outside apt is deleted here.%b\n\n' "$cleanup_indent" "$C_TIP" "$C_RESET"
-  if [ "$mode" = "preview" ]; then
-    printf '%s%bDry-run previews these commands without asking for input.%b\n\n' "$cleanup_indent" "$C_UNIT" "$C_RESET"
-  else
-    printf '%s%bAnswer y/N at the prompt below.%b\n\n' "$cleanup_indent" "$C_UNIT" "$C_RESET"
-  fi
-}
-
-workstation_cleanup_question() {
-  local mode="${1:-prompt}"
-  printf '\n'
-  printf '   %bWORKSTATION CACHE CLEANUP?%b\n' "$C_UNIT" "$C_RESET"
-  printf '   %bThis removes rebuildable caches and old update leftovers only.%b\n' "$C_PURPOSE" "$C_RESET"
-  printf '   %bIt leaves archives, LLM weights, project data, active virtualenvs, and databases alone.%b\n' "$C_TIP" "$C_RESET"
-  printf '   %bTargets include npm/npx, pip, uv prune, Homebrew cleanup, browser automation caches, Python bytecode, disabled snap revisions, and journal trim.%b\n\n' "$C_PURPOSE" "$C_RESET"
-  if [ "$mode" = "preview" ]; then
-    printf '   %bDry-run previews these commands without asking for input.%b\n\n' "$C_UNIT" "$C_RESET"
-  else
-    printf '   %bAnswer y/N at the prompt below.%b\n\n' "$C_UNIT" "$C_RESET"
-  fi
-}
-
-run_workstation_cleanup() {
-  local code=0
-
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd npm cache clean --force
-    show_cmd rm -rf "$HOME/.npm/_npx"
-    show_cmd pip3 cache purge
-    show_cmd brew cleanup -s
-    show_cmd timeout 20s uv cache prune
-    printf '%b$%b rm -rf ~/.cache/{camoufox,ms-playwright,BraveSoftware,electron,node-gyp,node,Homebrew,pip}\n' "$C_CMD" "$C_RESET"
-    printf '%b$%b find ~ -xdev -type d \\( -name __pycache__ -o -name .pytest_cache \\) -prune -exec rm -rf -- {} +\n' "$C_CMD" "$C_RESET"
-    show_cmd rm -rf "$HOME/.codex/.tmp/plugins" "$HOME/.codex/.tmp/plugins.sha"
-    printf '%b$%b sudo remove disabled snap revisions from snap list --all\n' "$C_CMD" "$C_RESET"
-    show_cmd sudo journalctl --vacuum-size=512M
-    return 0
-  fi
-
-  if command -v npm >/dev/null 2>&1; then
-    run_cmd npm cache clean --force || code=1
-    rm -rf "$HOME/.npm/_npx" || code=1
-  fi
-
-  if command -v pip3 >/dev/null 2>&1; then
-    run_cmd pip3 cache purge || code=1
-  fi
-
-  if command -v brew >/dev/null 2>&1; then
-    run_cmd brew cleanup -s || code=1
-  fi
-
-  if command -v uv >/dev/null 2>&1; then
-    if command -v timeout >/dev/null 2>&1; then
-      run_cmd timeout 20s uv cache prune || code=1
-    else
-      run_cmd uv cache prune || code=1
-    fi
-  fi
-
-  rm -rf \
-    "$HOME/.cache/camoufox" \
-    "$HOME/.cache/ms-playwright" \
-    "$HOME/.cache/BraveSoftware" \
-    "$HOME/.cache/electron" \
-    "$HOME/.cache/node-gyp" \
-    "$HOME/.cache/node" \
-    "$HOME/.cache/Homebrew" \
-    "$HOME/.cache/pip" || code=1
-
-  find "$HOME" -xdev -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} + || code=1
-  rm -rf "$HOME/.codex/.tmp/plugins" "$HOME/.codex/.tmp/plugins.sha" || code=1
-
-  if command -v sudo >/dev/null 2>&1; then
-    # shellcheck disable=SC2016 # Keep the root cleanup script literal until bash -c receives it.
-    sudo_cmd env -u BASH_ENV -u ENV bash --noprofile --norc -c 'set -e
-if command -v snap >/dev/null 2>&1; then
-  snap list --all | while read -r name _ rev _ _ notes; do
-    [ -n "$name" ] || continue
-    [ "$name" = "Name" ] && continue
-    case "$notes" in
-      *disabled*) snap remove "$name" --revision="$rev" ;;
-    esac
-  done
-fi
-journalctl --vacuum-size=512M
-' || code=1
-  fi
-
-  return "$code"
-}
-
-show_pending_apt_updates() {
-  local line pkg old new count=0
-  pending_updates_begin "apt list --upgradable"
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in Listing*) continue ;; esac
-    pkg="${line%%/*}"
-    new="$(printf '%s\n' "$line" | awk '{print $2}')"
-    old="$(printf '%s\n' "$line" | sed -n 's/.*\[upgradable from: \([^]]*\)\].*/\1/p')"
-    [ -n "$pkg" ] || continue
-    [ -n "$new" ] || new="available"
-    [ -n "$old" ] || old="installed"
-    pending_update_line "$pkg" "$old" "$new"
-    count=$((count + 1))
-  done < <(apt list --upgradable 2>/dev/null || true)
-  [ "$count" -gt 0 ] || pending_update_note "none detected before this step"
-  printf '\n'
-}
-
-show_pending_npm_globals() {
-  local output line name current latest count=0
-  pending_updates_begin "npm outdated -g"
-  output="$(npm outdated -g --depth=0 2>/dev/null || true)"
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in Package\ *|---*) continue ;; esac
-    name="$(printf '%s\n' "$line" | awk '{print $1}')"
-    current="$(printf '%s\n' "$line" | awk '{print $2}')"
-    latest="$(printf '%s\n' "$line" | awk '{print $4}')"
-    [ -n "$name" ] || continue
-    [ -n "$current" ] || current="installed"
-    [ -n "$latest" ] || latest="available"
-    pending_update_line "$name" "$current" "$latest"
-    count=$((count + 1))
-  done <<< "$output"
-  [ "$count" -gt 0 ] || pending_update_note "none detected before this step"
-  printf '\n'
-}
-
-show_pending_brew_updates() {
-  local output line name old new count=0
-  pending_updates_begin "brew outdated --verbose"
-  output="$(brew outdated --verbose 2>/dev/null || true)"
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    name="$(printf '%s\n' "$line" | awk '{print $1}')"
-    old="$(printf '%s\n' "$line" | sed -n 's/^[^ ]* (\([^)]*\)).*/\1/p')"
-    new="$(printf '%s\n' "$line" | sed -n 's/.*< \(.*\)$/\1/p')"
-    if [ -n "$name" ] && [ -n "$old" ] && [ -n "$new" ]; then
-      pending_update_line "$name" "$old" "$new"
-    else
-      pending_update_note "$line"
-    fi
-    count=$((count + 1))
-  done <<< "$output"
-  [ "$count" -gt 0 ] || pending_update_note "none detected before this step"
-  printf '\n'
-}
-
-show_brew_tap_trust_preflight() {
-  local taps tap info idx untrusted_count=0 remove_code=0
-
-  pending_updates_begin "brew tap trust preflight"
-  printf '  %bWhat this checks:%b extra Homebrew tap repositories outside the default Homebrew set.\n' "$C_HEADER" "$C_RESET"
-  printf '  %bPlain English:%b an Untrusted tap is not automatically malware and it is not an expired license.\n' "$C_HEADER" "$C_RESET"
-  printf '  It means Homebrew cannot prove the tap belongs to a trusted source. A tap can define install and update code, so it deserves a pause.\n'
-  printf '  %bGold standard:%b remove unused or unrecognized untrusted taps; keep one only when you intentionally need it and trust its source.\n' "$C_HEADER" "$C_RESET"
-  printf '  update-all collected any untap choices before the update sweep started.\n'
-
-  taps="$(brew tap 2>/dev/null || true)"
-  if [ -z "$taps" ]; then
-    pending_update_note "no third-party taps are configured"
-    printf '\n'
-    track "brew tap trust" 0 "" "" "no third-party taps configured"
-    return 0
-  fi
-
-  while IFS= read -r tap; do
-    [ -n "$tap" ] || continue
-    info="$(brew tap-info "$tap" 2>&1 || true)"
-    if printf '%s\n' "$info" | grep -Eq '(^|[[:space:]])Untrusted($|[[:space:]])'; then
-      untrusted_count=$((untrusted_count + 1))
-      idx="$(brew_tap_index "$tap" 2>/dev/null || true)"
-      if [ -n "$idx" ]; then
-        pending_update_note "$tap: insight shown during upfront choices"
-        if choice_is_yes "${_ua_brew_untap_choices[$idx]}"; then
-          if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-            show_cmd brew untap "$tap"
-            add_concern "Trust source action" "Dry-run previewed removing the untrusted Homebrew tap $tap." "In a live run, answer yes only if you do not recognize or use this tap; Homebrew may refuse if installed tools still depend on it."
-          else
-            printf '%bRUN%b upfront choice was yes: untapping %s before brew update.\n' "$C_OK" "$C_RESET" "$tap"
-            if brew untap "$tap"; then
-              add_concern "Trust source removed" "Homebrew no longer reads package definitions from $tap." "Nothing else is needed unless you later discover a tool expected that tap; then install from a trusted source."
-            else
-              remove_code=1
-              add_concern "Trust source removal failed" "Homebrew could not untap $tap. This often happens when installed tools still depend on that tap." "Read the error above, decide whether those tools are still needed, and retry manually with care."
-            fi
-          fi
-        else
-          printf '%bKEEP%b %s left installed by upfront choice.\n' "$C_WARN" "$C_RESET" "$tap"
-          add_concern "Trust source left installed" "The untrusted Homebrew tap $tap stayed in your update path because the upfront answer was no." "This is not panic-worthy, but review it later. Keep it only if you recognize it and trust its source."
-        fi
-      else
-        printf '\n  %bPAUSE%b Homebrew marks %s as Untrusted.\n' "$C_WARN" "$C_RESET" "$tap"
-        printf '       note: this tap appeared after the upfront choices were collected, so update-all will not remove it during this run.\n'
-        printf '       command for manual review: brew untap %s\n' "$tap"
-        printf '%bKEEP%b %s left installed because no upfront choice exists.\n' "$C_WARN" "$C_RESET" "$tap"
-        add_concern "Trust source needs review" "The untrusted Homebrew tap $tap appeared after upfront choices were collected." "Review it manually with brew tap-info $tap, then remove it with brew untap $tap if it is unfamiliar or unused."
-      fi
-    else
-      pending_update_note "$tap: no untrusted marker reported"
-    fi
-  done <<< "$taps"
-
-  if [ "$untrusted_count" -eq 0 ]; then
-    pending_update_note "no untrusted taps reported by brew tap-info"
-    track "brew tap trust" 0 "" "" "no untrusted taps reported"
-  elif [ "$remove_code" -eq 0 ]; then
-    track "brew tap trust" 0 "" "" "reviewed $untrusted_count untrusted tap(s); removals were prompt-gated"
-  else
-    track "brew tap trust" 1 "" "" "one or more requested brew untap commands failed"
-  fi
-  printf '\n'
-  return "$remove_code"
-}
-
-confirm_step() {
-  local prompt="$1" answer
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    return 0
-  fi
-  if [ ! -t 0 ]; then
-    printf '%bSKIP%b %s requires an interactive terminal. Nothing removed.\n' "$C_WARN" "$C_RESET" "$prompt"
-    return 1
-  fi
-
-  printf '%b?%b %s [y/N] ' "$C_WARN" "$C_RESET" "$prompt"
-  IFS= read -r answer || return 1
-  case "$answer" in
-    y|Y|yes|YES|Yes) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-choice_is_yes() {
-  case "${1:-no}" in
-    yes) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-ask_optional_choice() {
-  local prompt="$1" answer
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    return 1
-  fi
-  if choice_is_yes "$_ua_answer_all_choice"; then
-    printf '%bALL%b %s -> yes\n' "$C_OK" "$C_RESET" "$prompt"
-    return 0
-  fi
-  if [ ! -t 0 ]; then
-    printf '%bSKIP%b %s requires an interactive terminal. Defaulting to no.\n' "$C_WARN" "$C_RESET" "$prompt"
-    return 1
-  fi
-
-  printf '%b?%b %s [y/n/a/all] ' "$C_WARN" "$C_RESET" "$prompt"
-  IFS= read -r answer || return 1
-  case "$answer" in
-    y|Y|yes|YES|Yes) return 0 ;;
-    n|N|no|NO|No) return 1 ;;
-    a|A|all|ALL|All)
-      _ua_answer_all_choice="yes"
-      printf '%bALL%b all mode: yes to every remaining optional question.\n' "$C_OK" "$C_RESET"
-      return 0
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-brew_tap_index() {
-  local tap="$1" i
-  for ((i = 0; i < ${#_ua_brew_taps[@]}; i++)); do
-    if [ "${_ua_brew_taps[$i]}" = "$tap" ]; then
-      printf '%s' "$i"
-      return 0
-    fi
-  done
-  return 1
-}
-
-inspect_brew_tap_trust() {
-  local taps tap info source installed installed_from_tap
-  _ua_brew_taps=()
-  _ua_brew_sources=()
-  _ua_brew_installed=()
-  _ua_brew_untap_choices=()
-
-  command -v brew >/dev/null 2>&1 || return 0
-  taps="$(brew tap 2>/dev/null || true)"
-  [ -n "$taps" ] || return 0
-
-  while IFS= read -r tap; do
-    [ -n "$tap" ] || continue
-    info="$(brew tap-info "$tap" 2>&1 || true)"
-    if printf '%s\n' "$info" | grep -Eq '(^|[[:space:]])Untrusted($|[[:space:]])'; then
-      source="$(printf '%s\n' "$info" | sed -n 's/^From:[[:space:]]*//p' | sed -n '1p')"
-      installed="$(brew list --formula --full-name 2>/dev/null; brew list --cask --full-name 2>/dev/null || true)"
-      installed_from_tap="$(printf '%s\n' "$installed" | grep -F "$tap/" || true)"
-      _ua_brew_taps+=("$tap")
-      _ua_brew_sources+=("$source")
-      _ua_brew_installed+=("$installed_from_tap")
-      _ua_brew_untap_choices+=("no")
-    fi
-  done <<< "$taps"
-}
-
-insight_row() {
-  local icon="$1" label="$2" text="$3" label_color="${4:-$C_LABEL}"
-  printf '  %b│%b %b%s%b %b%-12s%b %s\n' "$C_FRAME" "$C_RESET" "$C_UNIT" "$icon" "$C_RESET" "$label_color" "$label" "$C_RESET" "$text"
-}
-
-print_brew_tap_insight() {
-  local tap="$1" source="${2:-}" installed_from_tap="${3:-}"
-
-  printf '\n  %b╭─%b %bINSIGHT%b %bHomebrew trust warning%b\n' "$C_FRAME" "$C_RESET" "$C_ORANGE" "$C_RESET" "$C_HEADER" "$C_RESET"
-  printf '  %b│%b\n' "$C_FRAME" "$C_RESET"
-  insight_row "!" "Signal" "Homebrew marks this tap as Untrusted: $tap" "$C_WARN"
-  insight_row "?" "Tap" "A tap is an extra Homebrew package source, like an added shelf outside the default store." "$C_LABEL"
-  insight_row "?" "Untrusted" "Homebrew cannot prove who controls this source. That is a provenance warning, not a malware verdict." "$C_LABEL"
-  insight_row "?" "Untap means" "brew untap removes this package source from Homebrew, so future brew runs stop reading it." "$C_LABEL"
-  insight_row "OK" "Boundary" "It does not delete your projects or random files. Homebrew may refuse if installed tools still depend on it." "$C_OK"
-  insight_row "OK" "Panic level" "Do not panic. Pause, check whether you use it, and remove it if it is unfamiliar or unused." "$C_OK"
-  [ -n "$source" ] && insight_row ">" "Source" "$source" "$C_PATH"
-  if [ -n "$installed_from_tap" ]; then
-    insight_row ">" "Installed" "Tools from this tap were found below; keep only if you intentionally rely on them." "$C_WARN"
-    printf '%s\n' "$installed_from_tap" | while IFS= read -r item; do
-      [ -n "$item" ] || continue
-      printf '  %b│%b   %b-%b %s\n' "$C_FRAME" "$C_RESET" "$C_TIP" "$C_RESET" "$item"
-    done
-    insight_row ">" "Action" "Keep for now if you recognize those tools, then review the source before future upgrades." "$C_WARN"
-  else
-    insight_row ">" "Installed" "None detected from this tap by brew list --full-name." "$C_OK"
-    insight_row ">" "Action" "Recommended: untap it now. Unused untrusted taps should not stay in your update path." "$C_OK"
-  fi
-  insight_row "$" "Command" "brew untap $tap" "$C_CMD"
-  printf '  %b╰─%b %bPlain English:%b scary word, boring rule: unknown package sources deserve review.\n' "$C_FRAME" "$C_RESET" "$C_HEADER" "$C_RESET"
-}
-
-collect_optional_choices() {
+# ---------------------------------------------------------------------------
+# Selftest dispatcher (supports automated unit/PTY/visual test harnesses)
+# ---------------------------------------------------------------------------
+_ua_run_selftests() {
   local i
 
-  banner "CHOICES"
-  section "optional choices preflight"
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    printf '   %bDry-run:%b previewing optional prompt-gated steps without asking for input.\n' "$C_HEADER" "$C_RESET"
-    printf '   Live runs collect these choices here, before the update sweep starts.\n\n'
-  else
-    printf '   %bAnswer the optional risky or cleanup questions now.%b\n' "$C_HEADER" "$C_RESET"
-    printf '   Type %ba%b or %ball%b once to answer yes to every remaining optional question in this run.\n' "$C_CMD" "$C_RESET" "$C_CMD" "$C_RESET"
-    printf '   update-all will then run the update sweep without stopping for more prompts.\n\n'
-  fi
-
-  if command -v fwupdmgr >/dev/null 2>&1; then
-    if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-      _ua_firmware_choice="yes"
-      printf '%bDRY-RUN%b firmware updates will be previewed.\n' "$C_WARN" "$C_RESET"
-    elif ask_optional_choice "Check and apply firmware updates during this run? This may require vendor trust prompts or a reboot."; then
-      _ua_firmware_choice="yes"
-    else
-      _ua_firmware_choice="no"
-    fi
-  else
-    printf '%bSKIP%b firmware choice: fwupdmgr command not installed.\n' "$C_WARN" "$C_RESET"
-  fi
-
-  if command -v brew >/dev/null 2>&1; then
-    inspect_brew_tap_trust
-    if [ "${#_ua_brew_taps[@]}" -gt 0 ]; then
-      pending_updates_begin "brew tap trust preflight"
-      printf '  %bWhat this checks:%b extra Homebrew tap repositories outside the default Homebrew set.\n' "$C_HEADER" "$C_RESET"
-      printf '  %bPlain English:%b an Untrusted tap is not automatically malware and it is not an expired license.\n' "$C_HEADER" "$C_RESET"
-      printf '  It means Homebrew cannot prove the tap belongs to a trusted source. A tap can define install and update code, so it deserves a pause.\n'
-      printf '  %bGold standard:%b remove unused or unrecognized untrusted taps; keep one only when you intentionally need it and trust its source.\n' "$C_HEADER" "$C_RESET"
-      for ((i = 0; i < ${#_ua_brew_taps[@]}; i++)); do
-        print_brew_tap_insight "${_ua_brew_taps[$i]}" "${_ua_brew_sources[$i]}" "${_ua_brew_installed[$i]}"
-        if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-          _ua_brew_untap_choices[i]="yes"
-          printf '%bDRY-RUN%b untap command will be previewed for %s.\n' "$C_WARN" "$C_RESET" "${_ua_brew_taps[$i]}"
-        elif ask_optional_choice "Untap ${_ua_brew_taps[$i]} before brew update? Recommended yes if unused or unfamiliar; no if you intentionally rely on it."; then
-          _ua_brew_untap_choices[i]="yes"
-        fi
-      done
-      printf '\n'
-    else
-      pending_update_note "brew tap trust: no untrusted taps reported before this run"
-    fi
-  else
-    printf '%bSKIP%b brew tap choice: brew command not installed.\n' "$C_WARN" "$C_RESET"
-  fi
-
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    cleanup_question preview
-  else
-    cleanup_question
-  fi
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    _ua_apt_cleanup_choice="yes"
-    printf '%bDRY-RUN%b apt cleanup commands will be previewed.\n' "$C_WARN" "$C_RESET"
-  elif ask_optional_choice "Run apt cleanup at the end? This can purge packages apt says are no longer needed and clear apt caches."; then
-    _ua_apt_cleanup_choice="yes"
-  else
-    _ua_apt_cleanup_choice="no"
-  fi
-
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    workstation_cleanup_question preview
-  else
-    workstation_cleanup_question
-  fi
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    _ua_workstation_cleanup_choice="yes"
-    printf '%bDRY-RUN%b workstation cache cleanup commands will be previewed.\n' "$C_WARN" "$C_RESET"
-  elif ask_optional_choice "Run workstation cache cleanup at the end? This removes rebuildable caches and old update leftovers."; then
-    _ua_workstation_cleanup_choice="yes"
-  else
-    _ua_workstation_cleanup_choice="no"
-  fi
-
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    printf '\n%bOK%b Optional dry-run previews saved. Starting the command preview now.\n' "$C_OK" "$C_RESET"
-  else
-    printf '\n%bOK%b Optional choices saved. Starting the update sweep now.\n' "$C_OK" "$C_RESET"
-  fi
-}
-
-coverage_item() {
-  local title="$1" command_name="$2" action="$3"
-  if command -v "$command_name" >/dev/null 2>&1; then
-    printf '   %b%-24s%b %b%-11s%b %s\n' "$C_LABEL" "$title" "$C_RESET" "$C_OK" "will check" "$C_RESET" "$action"
-  else
-    printf '   %b%-24s%b %b%-11s%b %s\n' "$C_LABEL" "$title" "$C_RESET" "$C_TIP" "skip" "$C_RESET" "$command_name not installed"
-  fi
-}
-
-coverage_manual_item() {
-  printf '   %b%-24s%b %b%-11s%b %s\n' "$C_LABEL" "$1" "$C_RESET" "$C_WARN" "manual" "$C_RESET" "$2"
-}
-
-show_update_coverage_preflight() {
-  banner "COVERAGE"
-  section "coverage preflight"
-  tool_card "coverage" "update coverage" "current run" "installed tools only"
-  printf '   %bPlain English:%b update-all updates the common workstation things it can safely detect.\n' "$C_HEADER" "$C_RESET"
-  printf '   It calls first-party/package-manager commands; it never invents a private updater or silently edits projects.\n'
-  printf '   Secret safety: updater logs are redacted for common token/key shapes, and internal shell calls avoid shell startup files.\n\n'
-
-  coverage_item "apt / dpkg" "apt-get" "OS packages and package database health"
-  coverage_item "snap apps" "snap" "snap refresh"
-  coverage_item "flatpak apps" "flatpak" "flatpak update"
-  coverage_item "Node runtime" "update-node" "user-local Node runtime when update-node exists"
-  coverage_item "Corepack / pnpm / yarn" "corepack" "package-manager shims and activated managers"
-  coverage_item "npm globals" "npm" "npm itself and globally installed npm CLIs"
-  coverage_item "Claude Code CLI" "claude" "claude update"
-  coverage_item "Codex CLI" "codex" "codex update"
-  coverage_item "Homebrew/Linuxbrew" "brew" "brew update, tap trust preflight, brew upgrade"
-  coverage_item "Bun runtime" "bun" "bun upgrade"
-  coverage_item "uv tools" "uv" "uv self/tool updates"
-  coverage_item "pipx apps" "pipx" "pipx upgrade-all"
-  coverage_item "Rust toolchains" "rustup" "rustup update"
-  coverage_item "Cargo-installed CLIs" "cargo-install-update" "cargo install-update -a when helper exists"
-  coverage_item "GitHub extensions" "gh" "gh extension upgrade --all"
-  if command -v code >/dev/null 2>&1; then
-    coverage_item "VS Code extensions" "code" "code --update-extensions"
-  elif command -v codium >/dev/null 2>&1; then
-    coverage_item "VSCodium extensions" "codium" "codium --update-extensions"
-  else
-    printf '   %b%-24s%b %b%-11s%b %s\n' "$C_LABEL" "editor extensions" "$C_RESET" "$C_TIP" "skip" "$C_RESET" "code/codium not installed"
-  fi
-  coverage_item "Linux firmware" "fwupdmgr" "fwupdmgr update, prompt-gated"
-
-  printf '\n'
-  coverage_manual_item "project repositories" "manual by design; each repo needs tests and rollback context"
-  coverage_manual_item "active agent runtimes" "manual by design; Hermes/OpenClaw-style stacks should not be surprise-upgraded"
-  coverage_manual_item "containers/images" "manual by design; updating images can break running services"
-  coverage_manual_item "conda environments" "manual by design; environment solves are project-specific"
-  coverage_manual_item "LLM weights" "manual by design; downloads are large and workload-specific"
-  coverage_manual_item "shell profiles" "never sourced for update logic; do not store raw secrets in .bashrc"
-
-  track "coverage preflight" 0 "" "" "installed safe surfaces are updated; project-specific stacks stay explicit"
-}
-
-pkg_json_version() {
-  local file="$1"
-  [ -r "$file" ] || return 1
-  sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | sed -n '1p'
-}
-
-version_of() {
-  case "$1" in
-    dpkg)
-      command -v dpkg >/dev/null 2>&1 && dpkg --version 2>/dev/null | sed -n '1p'
-      ;;
-    apt)
-      command -v apt-get >/dev/null 2>&1 && apt-get --version 2>/dev/null | sed -n '1p'
-      ;;
-    apt-upgradable)
-      apt list --upgradable 2>/dev/null | awk 'NR>1{n++} END{printf "%s upgradable", n+0}'
-      ;;
-    node)
-      command -v node >/dev/null 2>&1 && printf '%s %s' "$(command -v node)" "$(node --version 2>/dev/null)"
-      ;;
-    npm-active)
-      command -v npm >/dev/null 2>&1 && printf '%s %s' "$(command -v npm)" "$(npm --version 2>/dev/null)"
-      ;;
-    npm-bundled)
-      local bundled="$HOME/.local/lib/node-current/lib/node_modules/npm/package.json" bundled_v
-      bundled_v="$(pkg_json_version "$bundled" 2>/dev/null || true)"
-      [ -n "$bundled_v" ] && printf '%s %s' "$bundled" "$bundled_v"
-      ;;
-    npm-globals)
-      command -v npm >/dev/null 2>&1 && printf 'prefix %s' "$(npm prefix -g 2>/dev/null)"
-      ;;
-    corepack)
-      command -v corepack >/dev/null 2>&1 && printf '%s %s' "$(command -v corepack)" "$(corepack --version 2>/dev/null)"
-      ;;
-    pnpm)
-      command -v pnpm >/dev/null 2>&1 && printf '%s %s' "$(command -v pnpm)" "$(COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version 2>/dev/null)"
-      ;;
-    yarn)
-      command -v yarn >/dev/null 2>&1 && printf '%s %s' "$(command -v yarn)" "$(COREPACK_ENABLE_DOWNLOAD_PROMPT=0 yarn --version 2>/dev/null)"
-      ;;
-    bun)
-      command -v bun >/dev/null 2>&1 && printf '%s %s' "$(command -v bun)" "$(bun --version 2>/dev/null)"
-      ;;
-    claude)
-      command -v claude >/dev/null 2>&1 && printf '%s %s' "$(command -v claude)" "$(claude --version 2>/dev/null | sed -n '1p')"
-      ;;
-    codex)
-      command -v codex >/dev/null 2>&1 && printf '%s %s' "$(command -v codex)" "$(codex --version 2>/dev/null | sed -n '1p')"
-      ;;
-    brew)
-      command -v brew >/dev/null 2>&1 && printf '%s %s' "$(command -v brew)" "$(brew --version 2>/dev/null | sed -n '1p')"
-      ;;
-    uv)
-      command -v uv >/dev/null 2>&1 && printf '%s %s' "$(command -v uv)" "$(uv --version 2>/dev/null | sed -n '1p')"
-      ;;
-    pipx)
-      command -v pipx >/dev/null 2>&1 && printf '%s %s' "$(command -v pipx)" "$(pipx --version 2>/dev/null)"
-      ;;
-    rustup)
-      command -v rustup >/dev/null 2>&1 && printf '%s %s' "$(command -v rustup)" "$(rustup --version 2>/dev/null | sed -n '1p')"
-      ;;
-    cargo)
-      command -v cargo >/dev/null 2>&1 && printf '%s %s' "$(command -v cargo)" "$(cargo --version 2>/dev/null | sed -n '1p')"
-      ;;
-    cargo-install-update)
-      command -v cargo-install-update >/dev/null 2>&1 && printf '%s %s' "$(command -v cargo-install-update)" "$(cargo-install-update --version 2>/dev/null | sed -n '1p')"
-      ;;
-    gh)
-      command -v gh >/dev/null 2>&1 && printf '%s %s' "$(command -v gh)" "$(gh --version 2>/dev/null | sed -n '1p')"
-      ;;
-    code)
-      command -v code >/dev/null 2>&1 && printf '%s %s' "$(command -v code)" "$(code --version 2>/dev/null | sed -n '1p')"
-      ;;
-    codium)
-      command -v codium >/dev/null 2>&1 && printf '%s %s' "$(command -v codium)" "$(codium --version 2>/dev/null | sed -n '1p')"
-      ;;
-    fwupd)
-      if command -v fwupdmgr >/dev/null 2>&1; then
-        local fwupd_version
-        fwupd_version="$(fwupdmgr --version 2>/dev/null | awk '$1 == "runtime" && $2 == "org.freedesktop.fwupd" {print $3; exit}')"
-        [ -n "$fwupd_version" ] || fwupd_version="$(fwupdmgr --version 2>/dev/null | awk '$2 == "org.freedesktop.fwupd" {print $3; exit}')"
-        [ -n "$fwupd_version" ] || fwupd_version="$(fwupdmgr --version 2>/dev/null | sed -n '1p')"
-        printf '%s fwupd %s' "$(command -v fwupdmgr)" "$fwupd_version"
-      fi
-      ;;
-    snap)
-      command -v snap >/dev/null 2>&1 && printf '%s %s' "$(command -v snap)" "$(snap version 2>/dev/null | awk '/^snap /{print $2; exit}')"
-      ;;
-    flatpak)
-      command -v flatpak >/dev/null 2>&1 && printf '%s %s' "$(command -v flatpak)" "$(flatpak --version 2>/dev/null)"
-      ;;
-  esac
-}
-
-track() {
-  local label="$1" code="$2" before="${3:-}" after="${4:-}" note="${5:-}" forced_status="${6:-}" status
-  _ua_labels+=("$label")
-  _ua_before+=("$before")
-  _ua_after+=("$after")
-  _ua_notes+=("$note")
-
-  if [ "$code" -ne 0 ]; then
-    status="FAIL"
-    rc=1
-  elif [ -n "$forced_status" ]; then
-    status="$forced_status"
-  elif [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
-    status="UPDATED"
-  elif [ -n "$before" ] && [ -n "$after" ]; then
-    status="UNCHANGED"
-  else
-    status="OK"
-  fi
-  tool_result "$status" "$note"
-  if [ -n "$before" ] || [ -n "$after" ]; then
-    print_receipt_version_pair "$status" "$before" "$after" "version" "   " 15
-  fi
-  _ua_stats+=("$status")
-}
-
-skip_step() {
-  _ua_labels+=("$1")
-  _ua_stats+=("SKIP")
-  _ua_before+=("")
-  _ua_after+=("")
-  _ua_notes+=("${2:-not installed}")
-  tool_result "SKIP" "${2:-not installed}"
-}
-
-skip_tool() {
-  local key="$1" title="$2" label="$3" note="${4:-not installed}" package="${5:-$1}"
-  section "$label"
-  tool_card "$key" "$title" "" "$package"
-  skip_step "$label" "$note"
-}
-
-add_concern() {
-  _ua_concern_titles+=("$1")
-  _ua_concern_notes+=("$2")
-  _ua_concern_actions+=("$3")
-}
-
-fwupd_has_installable_updates() {
-  grep -F "New version:" >/dev/null 2>&1
-}
-
-fwupd_needs_manual_attention() {
-  grep -Eiq 'Update State:[[:space:]]*Failed|Update Error:|failed to write-firmware|efivarsfs|UEFI Secure Boot|Signature Database|Key Exchange Key' >/dev/null 2>&1
-}
-
-firmware_summary_rows() {
-  awk '
-    function trim(s) {
-      sub(/^[[:space:]]+/, "", s)
-      sub(/[[:space:]]+$/, "", s)
-      return s
-    }
-    function clean(s) {
-      gsub(/\r/, "", s)
-      gsub(/^[[:space:]│├└─]+/, "", s)
-      return trim(s)
-    }
-    function after_colon(s) {
-      sub(/^.*:[[:space:]]*/, "", s)
-      return clean(s)
-    }
-    {
-      line = clean($0)
-      if (line ~ /:$/ && line !~ /^(Device Flags|Release Flags|Description|Issues?|GUIDs|Checksum):/) {
-        heading = line
-        sub(/:$/, "", heading)
-      }
-      if (line ~ /^Current version:/) {
-        current = after_colon(line)
-        device = heading
-      }
-      if (line ~ /^New version:/) {
-        count++
-        devices[count] = device
-        releases[count] = heading
-        old_versions[count] = current
-        new_versions[count] = after_colon(line)
-        urgencies[count] = "unknown"
-        summaries[count] = ""
-      }
-      if (count > 0 && line ~ /^Summary:/ && summaries[count] == "") {
-        summaries[count] = after_colon(line)
-      }
-      if (count > 0 && line ~ /^Urgency:/ && urgencies[count] == "unknown") {
-        urgencies[count] = after_colon(line)
-      }
-    }
-    END {
-      for (i = 1; i <= count; i++) {
-        printf "%s|%s|%s|%s|%s|%s\n", devices[i], releases[i], old_versions[i], new_versions[i], urgencies[i], summaries[i]
-      }
-    }
-  '
-}
-
-print_firmware_summary() {
-  local output="$1" rows count=0 device release old_version new_version urgency summary
-  rows="$(printf '%s\n' "$output" | firmware_summary_rows)"
-
-  printf '   %bFIRMWARE REVIEW%b\n' "$C_HEADER" "$C_RESET"
-  if [ -z "$rows" ]; then
-    printf '   %bPlain English:%b fwupd did not report installable firmware updates.\n' "$C_HEADER" "$C_RESET"
-    printf '   %b%s%b nothing to do here right now.\n\n' "$C_TIP" "action:" "$C_RESET"
-    return 0
-  fi
-
-  printf '   %bPlain English:%b firmware updates touch hardware-level code and can require reboot, vendor trust, or Secure Boot setup.\n' "$C_HEADER" "$C_RESET"
-  printf '   update-all is showing the useful parts here instead of dumping the scary raw fwupd tree.\n'
-  printf '   %bDefault action:%b review these manually later; update-all will not auto-apply risky firmware from the unattended flow.\n\n' "$C_TIP" "$C_RESET"
-
-  while IFS='|' read -r device release old_version new_version urgency summary; do
-    [ -n "$device$release$old_version$new_version" ] || continue
-    count=$((count + 1))
-    printf '   %b>%b %b%s%b\n' "$C_UNIT" "$C_RESET" "$C_HEADER" "${device:-Firmware device}" "$C_RESET"
-    [ -z "$release" ] || printf '      %b%-8s%b %s\n' "$C_LABEL" "release" "$C_RESET" "$release"
-    if [ -n "$old_version$new_version" ]; then
-      printf '      %b%-8s%b %b%s%b %b->%b %b%s%b\n' \
-        "$C_LABEL" "version" "$C_RESET" \
-        "$C_VERSION_BEFORE" "${old_version:-unknown}" "$C_RESET" \
-        "$C_FRAME" "$C_RESET" \
-        "$C_VERSION_AFTER" "${new_version:-unknown}" "$C_RESET"
-    fi
-    [ -z "$urgency" ] || [ "$urgency" = "unknown" ] || printf '      %b%-8s%b %s\n' "$C_WARN" "urgency" "$C_RESET" "$urgency"
-    [ -z "$summary" ] || printf '      %b%-8s%b %s\n' "$C_TIP" "means" "$C_RESET" "$summary"
-  done <<< "$rows"
-
-  printf '\n   %b%s%b review with %b%s%b when you can watch the machine and reboot if needed.\n\n' "$C_TIP" "action:" "$C_RESET" "$C_CMD" "fwupdmgr get-updates" "$C_RESET"
-}
-
-npm_output_needs_claude_script_retry() {
-  grep -Eiq 'allow-scripts.*@anthropic-ai/claude-code|@anthropic-ai/claude-code.*allowScripts|@anthropic-ai/claude-code.*postinstall' >/dev/null 2>&1
-}
-
-uv_output_has_stale_extra_warning() {
-  grep -Eiq 'does not have an extra named' >/dev/null 2>&1
-}
-
-output_implies_update() {
-  grep -Eiq '(^|[[:space:]])changed [1-9][0-9]* packages?|(^|[[:space:]])(added|removed|updated|upgraded) [1-9][0-9]* packages?|(^|[[:space:]])Upgraded [1-9][0-9]* outdated packages?' >/dev/null 2>&1
-}
-
-first_arrow_delta() {
-  sed -nE 's/^[[:space:]]*([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]+->[[:space:]]+([^[:space:]()]+).*/\1|\2|\3/p' | sed -n '1p'
-}
-
-uv_tool_delta() {
-  awk '
-    /^Modified .* environment/ {
-      env=$0
-      sub(/^Modified /, "", env)
-      sub(/ environment$/, "", env)
-    }
-    /^[[:space:]]*-[[:space:]]*[^=]+==/ && old == "" {
-      old=$0
-      sub(/^[[:space:]]*-[[:space:]]*/, "", old)
-    }
-    /^[[:space:]]*\+[[:space:]]*[^=]+==/ && new == "" {
-      new=$0
-      sub(/^[[:space:]]*\+[[:space:]]*/, "", new)
-    }
-    END {
-      if (old != "" && new != "") {
-        old_pkg=old
-        new_pkg=new
-        sub(/==.*/, "", old_pkg)
-        sub(/==.*/, "", new_pkg)
-        old_ver=old
-        new_ver=new
-        sub(/^[^=]+==/, "", old_ver)
-        sub(/^[^=]+==/, "", new_ver)
-        if (old_pkg == new_pkg) {
-          printf "%s|%s|%s|%s\n", old_pkg, old_ver, new_ver, env
-        }
-      }
-    }
-  '
-}
-
-receipt_version() {
-  local value="${1:-}" path rest
-  [ -n "$value" ] || {
-    printf '-'
-    return 0
-  }
-  case "$value" in
-    /*)
-      path="${value%% *}"
-      rest="${value#"$path"}"
-      rest="${rest# }"
-      [ -n "$rest" ] || rest="installed"
-      printf '%s' "$rest"
-      ;;
-    *)
-      printf '%s' "$value"
-      ;;
-  esac
-}
-
-status_meaning() {
-  case "$1" in
-    UPDATED) printf 'updated: something changed during this step' ;;
-    OK) printf 'checked: command completed normally' ;;
-    UNCHANGED) printf 'already current: no visible version change' ;;
-    SKIP) printf 'skipped safely: tool is missing or intentionally left alone' ;;
-    FAIL) printf 'failed: this needs review before trusting the whole run' ;;
-    *) printf 'recorded by update-all' ;;
-  esac
-}
-
-receipt_status_style() {
-  local stat="$1" __icon_var="$2" __color_var="$3" selected_icon selected_color
-  case "$stat" in
-    UPDATED)   selected_icon="↗"; selected_color="$C_OK" ;;
-    OK)        selected_icon="✓"; selected_color="$C_OK" ;;
-    UNCHANGED) selected_icon="="; selected_color="$C_WARN" ;;
-    FAIL)      selected_icon="✗"; selected_color="$C_BAD" ;;
-    SKIP)      selected_icon="·"; selected_color="$C_TIP" ;;
-    *)         selected_icon="?"; selected_color="$C_RESET" ;;
-  esac
-  printf -v "$__icon_var" '%s' "$selected_icon"
-  printf -v "$__color_var" '%s' "$selected_color"
-}
-
-receipt_version_pair_colors() {
-  local stat="$1" __before_var="$2" __after_var="$3" selected_before_color selected_after_color
-  case "$stat" in
-    UPDATED)
-      selected_before_color="$C_VERSION_BEFORE"
-      selected_after_color="$C_VERSION_AFTER"
-      ;;
-    FAIL)
-      selected_before_color="$C_BAD"
-      selected_after_color="$C_BAD"
-      ;;
-    UNCHANGED)
-      selected_before_color="$C_VERSION_BEFORE"
-      selected_after_color="$C_VERSION_BEFORE"
-      ;;
-    *)
-      selected_before_color="$C_TIP"
-      selected_after_color="$C_TIP"
-      ;;
-  esac
-  printf -v "$__before_var" '%s' "$selected_before_color"
-  printf -v "$__after_var" '%s' "$selected_after_color"
-}
-
-print_receipt_version_pair() {
-  local stat="$1" before_raw="${2:-}" after_raw="${3:-}" label="${4:-version}" indent="${5:-     }" label_width="${6:-8}"
-  local before after before_color after_color
-  [ -n "$before_raw" ] || before_raw="-"
-  [ -n "$after_raw" ] || after_raw="-"
-  [ "$before_raw" != "-" ] || [ "$after_raw" != "-" ] || return 0
-
-  before="$(receipt_value "$(receipt_version "$before_raw")" 34)"
-  after="$(receipt_value "$(receipt_version "$after_raw")" 34)"
-  receipt_version_pair_colors "$stat" before_color after_color
-  if [ "$stat" = "UPDATED" ]; then
-    printf '%s%b%-*s%b %b%-6s%b %b%s%b\n' \
-      "$indent" "$C_LABEL" "$label_width" "$label" "$C_RESET" \
-      "$C_VERSION_BEFORE_LABEL" "before" "$C_RESET" \
-      "$before_color" "$before" "$C_RESET"
-    printf '%s%b%-*s%b %b%-6s%b %b%s%b\n' \
-      "$indent" "$C_LABEL" "$label_width" "" "$C_RESET" \
-      "$C_VERSION_AFTER_LABEL" "after" "$C_RESET" \
-      "$after_color" "$after" "$C_RESET"
-  else
-    printf '%s%b%-*s%b %b%-6s%b %b%s%b\n' \
-      "$indent" "$C_LABEL" "$label_width" "$label" "$C_RESET" \
-      "$C_VERSION_BEFORE_LABEL" "before" "$C_RESET" \
-      "$before_color" "$before" "$C_RESET"
-    printf '%s%b%-*s%b %b%-6s%b %b%s%b\n' \
-      "$indent" "$C_LABEL" "$label_width" "" "$C_RESET" \
-      "$C_VERSION_BEFORE_LABEL" "after" "$C_RESET" \
-      "$after_color" "$after" "$C_RESET"
-  fi
-}
-
-print_changed_story() {
-  local bar="$1" i count=0
-
-  printf '  %bWHAT CHANGED%b  %b(old -> new)%b\n' "$C_HEADER" "$C_RESET" "$C_TIP" "$C_RESET"
-  printf '%b\n' "$bar"
-
-  for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
-    [ "${_ua_stats[$i]}" = "UPDATED" ] || continue
-    count=$((count + 1))
-    local before after note
-    before="$(receipt_value "$(receipt_version "${_ua_before[$i]}")" 34)"
-    after="$(receipt_value "$(receipt_version "${_ua_after[$i]}")" 34)"
-    note="${_ua_notes[$i]}"
-    printf '  %b↗ UPDATED%b  %s\n' "$C_OK" "$C_RESET" "$(styled_package_name "${_ua_labels[$i]}")"
-    if [ "$before" != "-" ] || [ "$after" != "-" ]; then
-      if [ "$before" = "$after" ]; then
-        printf '     %b%-8s%b %b%-6s%b %b%s%b\n' "$C_LABEL" "version" "$C_RESET" "$C_VERSION_AFTER_LABEL" "after" "$C_RESET" "$C_VERSION_AFTER" "$after" "$C_RESET"
-        printf '     %b%-8s%b %b(no visible version change; updater still changed packages or metadata)%b\n' "$C_LABEL" "" "$C_RESET" "$C_TIP" "$C_RESET"
-      else
-        print_receipt_version_pair "UPDATED" "$before" "$after"
-      fi
-    fi
-    [ -z "$note" ] || printf '     %b%s%b   %s\n' "$C_TIP" "means" "$C_RESET" "$note"
-  done
-
-  if [ "$count" -eq 0 ]; then
-    printf '  %b✓ No visible version changes%b\n' "$C_OK" "$C_RESET"
-    printf '     %b%s%b   Everything checked was already current, skipped safely, or completed without a version bump.\n' "$C_TIP" "means" "$C_RESET"
-  fi
-  printf '%b\n' "$bar"
-}
-
-print_no_action_needed() {
-  local bar="$1" i count=0 icon color
-
-  printf '  %bNO ACTION NEEDED%b\n' "$C_HEADER" "$C_RESET"
-  printf '%b\n' "$bar"
-
-  for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
-    case "${_ua_stats[$i]}" in
-      OK|UNCHANGED|SKIP) ;;
-      *) continue ;;
-    esac
-    count=$((count + 1))
-    receipt_status_style "${_ua_stats[$i]}" icon color
-    printf '  %b%s %-9s%b %s\n' "$color" "$icon" "${_ua_stats[$i]}" "$C_RESET" "$(styled_package_name "${_ua_labels[$i]}")"
-    printf '     %b%s%b   %s\n' "$C_TIP" "means" "$C_RESET" "$(status_meaning "${_ua_stats[$i]}")"
-    if [ -n "${_ua_before[$i]}" ] || [ -n "${_ua_after[$i]}" ]; then
-      print_receipt_version_pair "${_ua_stats[$i]}" "${_ua_before[$i]}" "${_ua_after[$i]}"
-    fi
-    [ -z "${_ua_notes[$i]}" ] || printf '     %b%s%b    %s\n' "$C_TIP" "note" "$C_RESET" "${_ua_notes[$i]}"
-  done
-
-  [ "$count" -gt 0 ] || printf '  %bNo quiet rows recorded.%b\n' "$C_TIP" "$C_RESET"
-  printf '%b\n' "$bar"
-}
-
-print_attention_story() {
-  local bar="$1" i
-
-  printf '  %bNEEDS YOUR ATTENTION%b\n' "$C_HEADER" "$C_RESET"
-  printf '%b\n' "$bar"
-
-  if [ "$rc" -ne 0 ]; then
-    printf '  %b✗ Failed step recorded%b\n' "$C_BAD" "$C_RESET"
-    printf '     %b%s%b  Read the FAIL rows in the detailed receipt below before closing this tab.\n' "$C_TIP" "action" "$C_RESET"
-  fi
-
-  if [ "${#_ua_concern_titles[@]}" -eq 0 ] && [ "$rc" -eq 0 ]; then
-    printf '  %b✓ Nothing urgent recorded%b\n' "$C_OK" "$C_RESET"
-    printf '     %b%s%b   No manual follow-up was detected during this run.\n' "$C_TIP" "means" "$C_RESET"
-  fi
-
-  for ((i = 0; i < ${#_ua_concern_titles[@]}; i++)); do
-    printf '  %b> %s%b\n' "$C_UNIT" "${_ua_concern_titles[$i]}" "$C_RESET"
-    print_receipt_field "     " "means:" "${_ua_concern_notes[$i]}" "$C_RESET" 8 74 "$C_TIP"
-    print_receipt_field "     " "action:" "${_ua_concern_actions[$i]}" "$C_RESET" 8 74 "$C_TIP"
-  done
-  printf '%b\n' "$bar"
-}
-
-report() {
-  local bar i updated=0 ok=0 unchanged=0 failed=0 skipped=0
-  _ua_ended_s="$(date +%s)"
-  _ua_elapsed=$(( _ua_ended_s - _ua_started_s ))
-
-  for ((i = 0; i < ${#_ua_stats[@]}; i++)); do
-    case "${_ua_stats[$i]}" in
-      UPDATED) updated=$((updated + 1)) ;;
-      OK) ok=$((ok + 1)) ;;
-      UNCHANGED) unchanged=$((unchanged + 1)) ;;
-      FAIL) failed=$((failed + 1)) ;;
-      SKIP) skipped=$((skipped + 1)) ;;
-    esac
-  done
-
-  banner "RECEIPT"
-  bar="${C_FRAME}$(printf '%.0s─' {1..88})${C_RESET}"
-  printf '%b\n' "$bar"
-  printf '  %b%-16s%b %s\n' "$C_HEADER" "started" "$C_RESET" "$_ua_started_h"
-  printf '  %b%-16s%b %ss\n' "$C_HEADER" "elapsed" "$C_RESET" "$_ua_elapsed"
-  printf '%b  receipt summary%b    %b%s updated%b  %b%s ok%b  %b%s unchanged%b  %b%s skipped%b  %b%s failed%b\n' \
-    "$C_HEADER" "$C_RESET" \
-    "$C_OK" "$updated" "$C_RESET" \
-    "$C_OK" "$ok" "$C_RESET" \
-    "$C_RESULT" "$unchanged" "$C_RESET" \
-    "$C_TIP" "$skipped" "$C_RESET" \
-    "$C_BAD" "$failed" "$C_RESET"
-  printf '%b\n' "$bar"
-
-  print_changed_story "$bar"
-  print_attention_story "$bar"
-  print_no_action_needed "$bar"
-  printf '\n'
-
-  printf '  %bRUN DETAILS%b\n' "$C_HEADER" "$C_RESET"
-  printf '%b\n' "$bar"
-
-  for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
-    local lbl="${_ua_labels[$i]}"
-    local stat="${_ua_stats[$i]}"
-    local before="${_ua_before[$i]}"
-    local after="${_ua_after[$i]}"
-    local note="${_ua_notes[$i]}"
-    local icon color
-
-    case "$stat" in
-      UPDATED)   icon="↗"; color="$C_OK" ;;
-      OK)        icon="✓"; color="$C_OK" ;;
-      UNCHANGED) icon="="; color="$C_WARN" ;;
-      FAIL)      icon="✗"; color="$C_BAD" ;;
-      SKIP)      icon="·"; color="$C_TIP" ;;
-      *)         icon="?"; color="$C_RESET" ;;
-    esac
-
-    printf '  %b%s %-9s%b ' "$color" "$icon" "$stat" "$C_RESET"
-    printf '%s\n' "$(styled_package_name "$lbl")"
-    if [ -n "$before" ] || [ -n "$after" ]; then
-      print_receipt_version_pair "$stat" "$before" "$after"
-    fi
-    if [ -n "$note" ]; then
-      printf '     %b%-8s%b %s\n' "$C_TIP" "note:" "$C_RESET" "$note"
-    fi
-  done
-
-  printf '%b\n' "$bar"
-  print_receipt_field "  " "active npm" "$(version_of npm-active 2>/dev/null || printf 'not found')" "$C_RESET" 12 72 "$C_HEADER"
-  print_receipt_field "  " "bundled npm" "$(version_of npm-bundled 2>/dev/null || printf 'not found')" "$C_RESET" 12 72 "$C_HEADER"
-  print_receipt_field "  " "npm fund" "npm funding notices are optional donation links, not errors or bills." "$C_RESET" 12 72 "$C_HEADER"
-  print_receipt_field "  " "notes" "package purpose notes are plain-English guidance; registry/advisory lookups belong to Safety Coach Mode." "$C_RESET" 12 72 "$C_HEADER"
-  printf '%b\n\n' "$bar"
-
-  cleanup_next_steps "$bar"
-  after_run_check_in "$bar"
-
-  if [ "$rc" -eq 0 ]; then
-    printf '%b✓  update-all finished without failed steps%b\n\n' "$C_OK" "$C_RESET"
-  else
-    printf '%b✗  one or more steps failed - see FAIL rows above%b\n\n' "$C_BAD" "$C_RESET"
-  fi
-}
-
-receipt_visual_selftest() {
-  _ua_started_s="$(date +%s)"
-  _ua_started_h="2026-07-01 00:00:00 TEST"
-  rc=0
-  _ua_labels=("yarn (corepack)" "brew formula: libevent" "uv tool: pillow" "apt upgrade" "flatpak update" "coverage preflight")
-  _ua_stats=("UPDATED" "UPDATED" "UPDATED" "UNCHANGED" "SKIP" "OK")
-  _ua_before=("/usr/bin/yarn 1.22.22" "libevent 2.1.12_1" "pillow 12.2.0" "0 upgradable" "" "")
-  _ua_after=("/usr/bin/yarn 4.17.0" "2.1.13" "12.3.0" "0 upgradable" "" "")
-  _ua_notes=("bounded by UPDATE_ALL_COREPACK_TIMEOUT (default 90s)" "Homebrew upgraded a formula" "uv updated the nano-pdf tool environment" "" "flatpak command not installed" "installed safe surfaces are updated; project-specific stacks stay explicit")
-  add_concern "Firmware needs manual attention" "fwupd has UEFI/Secure Boot firmware updates that should not be blindly applied." "Review with fwupdmgr get-updates when you are ready to watch it."
-  report
-}
-
-cleanup_status_for() {
-  local label="$1" i
-  for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
-    if [ "${_ua_labels[$i]}" = "$label" ]; then
-      printf '%s' "${_ua_stats[$i]}"
-      return 0
-    fi
-  done
-  printf 'SKIP'
-}
-
-cleanup_note_for() {
-  local label="$1" i
-  for ((i = 0; i < ${#_ua_labels[@]}; i++)); do
-    if [ "${_ua_labels[$i]}" = "$label" ]; then
-      printf '%s' "${_ua_notes[$i]}"
-      return 0
-    fi
-  done
-  printf 'not reached'
-}
-
-print_receipt_field() {
-  local indent="$1" label="$2" text="$3" text_color="${4:-$C_RESET}" label_width="${5:-8}" wrap_width="${6:-74}" label_color="${7:-$C_LABEL}"
-  local line first=1
-  [ -n "$text" ] || return 0
-
-  while IFS= read -r line; do
-    if [ "$first" -eq 1 ]; then
-      printf '%s%b%-*s%b %b%s%b\n' "$indent" "$label_color" "$label_width" "$label" "$C_RESET" "$text_color" "$line" "$C_RESET"
-      first=0
-    else
-      printf '%s%*s %b%s%b\n' "$indent" "$label_width" "" "$text_color" "$line" "$C_RESET"
-    fi
-  done < <(printf '%s\n' "$text" | fold -s -w "$wrap_width")
-}
-
-cleanup_next_steps() {
-  local bar="$1" apt_status cache_status apt_note cache_note
-  apt_status="$(cleanup_status_for "apt autoremove")"
-  cache_status="$(cleanup_status_for "workstation cache cleanup")"
-  apt_note="$(cleanup_note_for "apt autoremove")"
-  cache_note="$(cleanup_note_for "workstation cache cleanup")"
-
-  printf '  %bCLEANUP NEXT STEPS%b\n' "$C_HEADER" "$C_RESET"
-  printf '%b\n' "$bar"
-  printf '  %b%-18s%b %b%s%b\n' "$C_LABEL" "apt cleanup" "$C_RESET" "$C_RESULT" "$apt_status" "$C_RESET"
-  print_receipt_field "     " "note:" "$apt_note" "$C_RESET" 8 74 "$C_TIP"
-  printf '  %b%-18s%b %b%s%b\n' "$C_LABEL" "cache cleanup" "$C_RESET" "$C_RESULT" "$cache_status" "$C_RESET"
-  print_receipt_field "     " "note:" "$cache_note" "$C_RESET" 8 74 "$C_TIP"
-  print_receipt_field "  " "guidance" "Cleanup choices are collected before updates start: answer yes only for cleanup you understand, and use --dry-run to preview commands again." "$C_PURPOSE" 18 64 "$C_LABEL"
-  printf '%b\n\n' "$bar"
-}
-
-after_run_check_in() {
-  local bar="$1" i
-
-  printf '  %bAFTER-RUN CHECK-IN%b\n' "$C_HEADER" "$C_RESET"
-  printf '%b\n' "$bar"
-  print_receipt_field "  " "purpose" "What to resolve after this run, in plain English." "$C_PURPOSE" 18 64 "$C_LABEL"
-
-  if [ "$rc" -ne 0 ]; then
-    print_receipt_field "  " "status" "One or more update steps failed. Start with the FAIL rows above; the command did not finish cleanly." "$C_BAD" 18 64 "$C_LABEL"
-  elif [ "${#_ua_concern_titles[@]}" -eq 0 ]; then
-    print_receipt_field "  " "status" "No unresolved concerns were recorded. You can close the terminal or read the receipt for learning." "$C_OK" 18 64 "$C_LABEL"
-  else
-    print_receipt_field "  " "status" "The update sweep finished; review these notes when you come back." "$C_WARN" 18 64 "$C_LABEL"
-  fi
-
-  for ((i = 0; i < ${#_ua_concern_titles[@]}; i++)); do
-    printf '\n  %b%s%b %b%s%b\n' "$C_UNIT" ">" "$C_RESET" "$C_HEADER" "${_ua_concern_titles[$i]}" "$C_RESET"
-    print_receipt_field "     " "means:" "${_ua_concern_notes[$i]}" "$C_RESET" 8 74 "$C_TIP"
-    print_receipt_field "     " "action:" "${_ua_concern_actions[$i]}" "$C_RESET" 8 74 "$C_TIP"
-  done
-
-  printf '%b\n\n' "$bar"
-}
-
-receipt_value() {
-  local value="$1" max="${2:-74}" left right
-  if [ "${#value}" -le "$max" ]; then
-    printf '%s' "$value"
-    return 0
-  fi
-  left=$(( (max - 3) / 2 ))
-  right=$(( max - 3 - left ))
-  printf '%s...%s' "${value:0:left}" "${value: -right}"
-}
-
-sudo_restore_traps() {
-  if [ -n "$_ua_prev_int_trap" ]; then eval "$_ua_prev_int_trap"; else trap - INT; fi
-  if [ -n "$_ua_prev_term_trap" ]; then eval "$_ua_prev_term_trap"; else trap - TERM; fi
-}
-
-sudo_keepalive_stop() {
-  [ "${_ua_sudo_keepalive_stopped:-0}" -eq 0 ] || return 0
-  _ua_sudo_keepalive_stopped=1
-  if [ -n "${_ua_sudo_keepalive_pid:-}" ]; then
-    kill "$_ua_sudo_keepalive_pid" 2>/dev/null || true
-    wait "$_ua_sudo_keepalive_pid" 2>/dev/null || true
-    _ua_sudo_keepalive_pid=""
-  fi
-  sudo_restore_traps
-}
-
-sudo_keepalive_abort() {
-  sudo_keepalive_stop
-  exit 130
-}
-
-prime_sudo() {
-  [ "$UPDATE_ALL_DRY_RUN" = 0 ] || return 0
-  command -v sudo >/dev/null 2>&1 || return 0
-  sudo_secret_available && return 0
-
-  sudo_cmd -v || return $?
-
-  local monitor_was_on=0
-  case "$-" in *m*) monitor_was_on=1; set +m ;; esac
-  {
-    (
-      while true; do
-        sleep 60
-        sudo_cmd -v >/dev/null 2>&1 || exit
-      done
-    ) &
-    _ua_sudo_keepalive_pid=$!
-  } 2>/dev/null
-  [ "$monitor_was_on" -eq 1 ] && set -m
-  trap sudo_keepalive_abort INT TERM
-}
-
-run_updates() {
-  local before after dpkg_audit dpkg_audit_code
-
-  show_update_coverage_preflight
-
-  banner "SYSTEM"
-  section "dpkg audit"
-  tool_card "dpkg" "dpkg audit"
-  if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-    show_cmd sudo dpkg --audit
-    track "dpkg audit" 0 "" "" "dry-run: dpkg state not changed"
-  else
-    dpkg_audit="$(sudo_cmd dpkg --audit 2>&1)"
-    dpkg_audit_code=$?
-    if [ "$dpkg_audit_code" -ne 0 ]; then
-      printf '%s\n' "$dpkg_audit"
-      track "dpkg audit" "$dpkg_audit_code" "" "" "could not inspect dpkg state"
-    elif [ -n "$dpkg_audit" ]; then
-      printf '%s\n' "$dpkg_audit"
-      track "dpkg audit" 0 "" "" "pending package configuration detected"
-      section "dpkg configure"
-      sudo_cmd env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
-      track "dpkg configure" $?
-    else
-      track "dpkg audit" 0 "" "" "dpkg state clean"
-    fi
-  fi
-
-  section "apt update"
-  tool_card "apt" "apt package index"
-  sudo_cmd env TERM=dumb apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress-Fancy=0 -o Dpkg::Progress-Fancy=0 update -y
-  track "apt update" $?
-
-  before="$(version_of apt-upgradable 2>/dev/null || true)"
-  section "apt upgrade"
-  tool_card "apt" "apt package upgrade" "$before"
-  show_pending_apt_updates
-  sudo_cmd env TERM=dumb apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress-Fancy=0 -o Dpkg::Progress-Fancy=0 -o Dpkg::Options::=--force-confold upgrade -y
-  after="$(version_of apt-upgradable 2>/dev/null || true)"
-  track "apt upgrade" $? "$before" "$after"
-  case "$after" in
-    ""|"0 upgradable") ;;
-    *)
-      add_concern "System packages still pending" "apt still reports $after after the upgrade. Ubuntu may defer phased updates or hold packages for safety." "Usually this is not urgent. Run update-all later, or inspect with apt list --upgradable if you want to learn what remains."
-      ;;
-  esac
-
-  if command -v snap >/dev/null 2>&1; then
-    before="$(version_of snap 2>/dev/null || true)"
-    section "snap refresh"
-    tool_card "snap" "snap packages" "$before"
-    sudo_cmd snap refresh
-    after="$(version_of snap 2>/dev/null || true)"
-    track "snap refresh" $? "$before" "$after"
-  else
-    skip_tool "snap" "snap packages" "snap refresh" "snap command not installed" "snap"
-  fi
-
-  if command -v flatpak >/dev/null 2>&1; then
-    before="$(version_of flatpak 2>/dev/null || true)"
-    section "flatpak update"
-    tool_card "flatpak" "flatpak apps" "$before"
-    run_cmd flatpak update -y --noninteractive
-    after="$(version_of flatpak 2>/dev/null || true)"
-    track "flatpak update" $? "$before" "$after"
-  else
-    skip_tool "flatpak" "flatpak apps" "flatpak update" "flatpak command not installed" "flatpak"
-  fi
-
-  if command -v fwupdmgr >/dev/null 2>&1; then
-    before="$(version_of fwupd 2>/dev/null || true)"
-    section "firmware updates"
-    tool_card "fwupd" "Linux firmware updates" "$before" "fwupdmgr update"
-    if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-      show_cmd fwupdmgr refresh --force
-      show_cmd fwupdmgr get-updates
-      show_cmd fwupdmgr update
-      after="$(version_of fwupd 2>/dev/null || true)"
-      track "firmware updates" 0 "$before" "$after" "dry-run: firmware update is prompt-gated in a live run"
-    elif choice_is_yes "$_ua_firmware_choice"; then
-      local fw_updates_output fw_update_output
-      run_cmd fwupdmgr refresh --force
-      local fw_refresh=$?
-      run_cmd_capture_quiet fw_updates_output fwupdmgr get-updates
-      local fw_updates=$?
-      print_firmware_summary "$fw_updates_output"
-      after="$(version_of fwupd 2>/dev/null || true)"
-      if [ "$fw_refresh" -ne 0 ]; then
-        track "firmware updates" 1 "$before" "$after" "fwupd metadata refresh failed with exit=$fw_refresh"
-      elif [ "$fw_updates" -ne 0 ] && ! printf '%s\n' "$fw_updates_output" | fwupd_needs_manual_attention; then
-        track "firmware updates" 1 "$before" "$after" "fwupd get-updates failed with exit=$fw_updates"
-      elif ! printf '%s\n' "$fw_updates_output" | fwupd_has_installable_updates; then
-        track "firmware updates" 0 "$before" "$after" "fwupd reports no installable firmware updates"
-      elif printf '%s\n' "$fw_updates_output" | fwupd_needs_manual_attention; then
-        track "firmware updates" 0 "$before" "$after" "fwupd reports UEFI/Secure Boot firmware needing manual attention; not auto-applied"
-        add_concern "Firmware needs manual attention" "fwupd has UEFI/Secure Boot firmware updates, and at least one previous attempt is marked failed by fwupd. This is hardware/firmware state, not a broken package update." "Review with fwupdmgr get-updates when you are ready to watch it. Expect possible firmware setup, Secure Boot, efivars, or reboot work outside update-all."
-      else
-        run_cmd_capture fw_update_output fwupdmgr update
-        local fw_update=$?
-        after="$(version_of fwupd 2>/dev/null || true)"
-        if [ "$fw_update" -eq 0 ]; then
-          track "firmware updates" 0 "$before" "$after" "fwupd completed; follow any reboot guidance it printed"
-        elif printf '%s\n' "$fw_update_output" | fwupd_needs_manual_attention; then
-          track "firmware updates" 0 "$before" "$after" "fwupd returned manual UEFI/Secure Boot attention; not counted as a workstation update failure"
-          add_concern "Firmware needs manual attention" "fwupd could not apply a UEFI/Secure Boot firmware update automatically. This usually needs a watched firmware flow, reboot, or machine-specific setup." "Review the fwupd output above, then handle firmware manually outside an unattended update-all run."
-        else
-          track "firmware updates" 1 "$before" "$after" "refresh exit=$fw_refresh, get-updates exit=$fw_updates, update exit=$fw_update"
-        fi
-      fi
-    else
-      skip_step "firmware updates" "skipped by upfront choice; firmware was not changed"
-      add_concern "Firmware skipped" "Firmware updates can require hardware trust prompts or a reboot, so they were skipped by the upfront choice." "Run update-all again and answer yes only when you are ready to watch that step and reboot if needed."
-    fi
-  else
-    skip_tool "fwupd" "Linux firmware updates" "firmware updates" "fwupdmgr command not installed" "fwupdmgr update"
-  fi
-
-  banner "NODE"
-  if command -v update-node >/dev/null 2>&1; then
-    before="$(version_of node 2>/dev/null || true)"
-    section "node runtime"
-    tool_card "node" "Node.js runtime" "$before" "node"
-    run_bounded "$UPDATE_ALL_NODE_TIMEOUT" update-node
-    after="$(version_of node 2>/dev/null || true)"
-    track "node runtime" $? "$before" "$after" "bounded by UPDATE_ALL_NODE_TIMEOUT (default 300s); update-node keeps Node inside the current major line"
-  else
-    skip_tool "node" "Node.js runtime" "node runtime" "update-node command not installed" "node"
-  fi
-
-  if command -v corepack >/dev/null 2>&1; then
-    before="$(version_of corepack 2>/dev/null || true)"
-    section "corepack enable"
-    tool_card "corepack" "Corepack shims" "$before" "corepack"
-    if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-      show_cmd env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack enable
-    else
-      run_bounded "$UPDATE_ALL_COREPACK_TIMEOUT" env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack enable
-    fi
-    hash -r 2>/dev/null || true
-    after="$(version_of corepack 2>/dev/null || true)"
-    track "corepack enable" $? "$before" "$after" "bounded by UPDATE_ALL_COREPACK_TIMEOUT (default 90s)"
-
-    if command -v pnpm >/dev/null 2>&1; then
-      before="$(version_of pnpm 2>/dev/null || true)"
-      section "pnpm self-update"
-      tool_card "pnpm" "pnpm package manager" "$before" "pnpm@latest"
-      if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-        show_cmd env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare pnpm@latest --activate
-      else
-        run_bounded "$UPDATE_ALL_COREPACK_TIMEOUT" env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare pnpm@latest --activate
-      fi
-      after="$(version_of pnpm 2>/dev/null || true)"
-      track "pnpm (corepack)" $? "$before" "$after" "bounded by UPDATE_ALL_COREPACK_TIMEOUT (default 90s)"
-    else
-      skip_tool "pnpm" "pnpm package manager" "pnpm self-update" "pnpm is not activated/installed" "pnpm@latest"
-    fi
-
-    if command -v yarn >/dev/null 2>&1; then
-      before="$(version_of yarn 2>/dev/null || true)"
-      section "yarn self-update"
-      tool_card "yarn" "Yarn package manager" "$before" "yarn@stable"
-      if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-        show_cmd env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare yarn@stable --activate
-      else
-        run_bounded "$UPDATE_ALL_COREPACK_TIMEOUT" env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare yarn@stable --activate
-      fi
-      after="$(version_of yarn 2>/dev/null || true)"
-      track "yarn (corepack)" $? "$before" "$after" "bounded by UPDATE_ALL_COREPACK_TIMEOUT (default 90s)"
-    else
-      skip_tool "yarn" "Yarn package manager" "yarn self-update" "yarn is not activated/installed" "yarn@stable"
-    fi
-  else
-    skip_tool "corepack" "Corepack shims" "corepack enable" "corepack command not installed" "corepack"
-    skip_tool "pnpm" "pnpm package manager" "pnpm self-update" "corepack command not installed" "pnpm@latest"
-    skip_tool "yarn" "Yarn package manager" "yarn self-update" "corepack command not installed" "yarn@stable"
-  fi
-
-  if command -v bun >/dev/null 2>&1; then
-    before="$(version_of bun 2>/dev/null || true)"
-    section "bun upgrade"
-    tool_card "bun" "Bun runtime" "$before" "bun upgrade"
-    run_cmd bun upgrade
-    after="$(version_of bun 2>/dev/null || true)"
-    track "bun upgrade" $? "$before" "$after" "uses Bun's first-party updater"
-  else
-    skip_tool "bun" "Bun runtime" "bun upgrade" "bun command not installed" "bun upgrade"
-  fi
-
-  banner "NPM"
-  if command -v npm >/dev/null 2>&1; then
-    before="$(version_of npm-active 2>/dev/null || true)"
-    section "npm self-update"
-    tool_card "npm" "npm self-update" "$before" "npm@latest"
-    local npm_self_output
-    run_cmd_capture npm_self_output npm install -g npm@latest --no-fund
-    local npm_self_code=$?
-    after="$(version_of npm-active 2>/dev/null || true)"
-    if printf '%s\n' "$npm_self_output" | output_implies_update; then
-      track "npm self-update" "$npm_self_code" "$before" "$after" "active npm is PATH-selected; bundled npm is shown separately in RECEIPT" "UPDATED"
-    else
-      track "npm self-update" "$npm_self_code" "$before" "$after" "active npm is PATH-selected; bundled npm is shown separately in RECEIPT"
-    fi
-
-    section "npm globals"
-    tool_card "npm-globals" "npm global packages"
-    show_pending_npm_globals
-    local npm_globals_output
-    run_cmd_capture npm_globals_output npm update -g --no-fund
-    local npm_globals_code=$?
-    if printf '%s\n' "$npm_globals_output" | npm_output_needs_claude_script_retry; then
-      printf '   %b%s%b npm blocked Claude Code postinstall during the global sweep; retrying that trusted package with scripts enabled for this command.\n' "$C_LABEL" "note" "$C_RESET"
-      if [ "$UPDATE_ALL_DRY_RUN" = 1 ]; then
-        show_cmd npm install -g --ignore-scripts=false @anthropic-ai/claude-code@latest --no-fund
-      else
-        run_cmd npm install -g --ignore-scripts=false @anthropic-ai/claude-code@latest --no-fund
-      fi
-      local npm_claude_script_code=$?
-      if [ "$npm_globals_code" -eq 0 ] && [ "$npm_claude_script_code" -eq 0 ]; then
-        track "npm globals" 0 "" "" "global packages updated; Claude Code postinstall warning auto-resolved"
-      else
-        track "npm globals" 1 "" "" "npm update exit=$npm_globals_code, Claude Code script retry exit=$npm_claude_script_code"
-      fi
-    else
-      track "npm globals" "$npm_globals_code"
-    fi
-
-    if command -v claude >/dev/null 2>&1; then
-      before="$(version_of claude 2>/dev/null || true)"
-      section "claude code"
-      tool_card "claude" "Claude Code CLI" "$before" "claude update"
-      run_cmd claude update
-      after="$(version_of claude 2>/dev/null || true)"
-      track "claude code" $? "$before" "$after" "uses Claude Code's first-party updater"
-    else
-      skip_tool "claude" "Claude Code CLI" "claude code" "claude command not installed" "claude update"
-    fi
-
-    if command -v codex >/dev/null 2>&1; then
-      before="$(version_of codex 2>/dev/null || true)"
-      section "codex"
-      tool_card "codex" "OpenAI Codex CLI" "$before" "codex update"
-      local codex_output
-      run_cmd_capture codex_output codex update
-      local codex_code=$?
-      after="$(version_of codex 2>/dev/null || true)"
-      if printf '%s\n' "$codex_output" | output_implies_update; then
-        track "codex" "$codex_code" "$before" "$after" "uses Codex CLI's first-party updater" "UPDATED"
-      else
-        track "codex" "$codex_code" "$before" "$after" "uses Codex CLI's first-party updater"
-      fi
-    else
-      skip_tool "codex" "OpenAI Codex CLI" "codex" "codex command not installed" "codex update"
-    fi
-
-    skip_tool "hermes" "Hermes Agent" "Hermes Agent" "intentionally not updated here; avoids breaking active agent workflows" "hermes-agent"
-  else
-    skip_tool "npm" "npm self-update" "npm self-update" "npm command not installed" "npm@latest"
-    skip_tool "npm-globals" "npm global packages" "npm globals" "npm command not installed" "npm"
-    skip_tool "claude" "Claude Code CLI" "claude code" "npm command not installed for global npm sweep; install Claude Code separately first" "claude update"
-    skip_tool "codex" "OpenAI Codex CLI" "codex" "npm command not installed for global npm sweep; install Codex separately first" "codex update"
-    skip_tool "hermes" "Hermes Agent" "Hermes Agent" "intentionally not updated here; avoids breaking active agent workflows" "hermes-agent"
-  fi
-
-  banner "TOOLS"
-  if command -v brew >/dev/null 2>&1; then
-    before="$(version_of brew 2>/dev/null || true)"
-    section "brew update + upgrade"
-    tool_card "brew" "Homebrew formulae" "$before"
-    show_brew_tap_trust_preflight || true
-    show_pending_brew_updates
-    local brew_output
-    run_shell_capture brew_output 'brew update && brew upgrade'
-    local brew_code=$?
-    after="$(version_of brew 2>/dev/null || true)"
-    if printf '%s\n' "$brew_output" | output_implies_update; then
-      local brew_delta brew_name brew_old brew_new
-      brew_delta="$(printf '%s\n' "$brew_output" | first_arrow_delta)"
-      if [ -n "$brew_delta" ]; then
-        IFS='|' read -r brew_name brew_old brew_new <<< "$brew_delta"
-        track "brew formula: $brew_name" "$brew_code" "$brew_name $brew_old" "$brew_new" "Homebrew upgraded this formula; Homebrew itself is $(receipt_version "$after")" "UPDATED"
-      else
-        track "brew upgrade" "$brew_code" "$before" "$after" "Homebrew upgraded one or more formulae; see the Homebrew lines above for package names" "UPDATED"
-      fi
-    else
-      track "brew upgrade" "$brew_code" "$before" "$after" "Homebrew updates itself and brew-managed formulae"
-    fi
-  else
-    skip_tool "brew" "Homebrew formulae" "brew upgrade" "brew command not installed" "brew"
-  fi
-
-  if command -v uv >/dev/null 2>&1; then
-    before="$(version_of uv 2>/dev/null || true)"
-    if command -v brew >/dev/null 2>&1 && case "$(command -v uv)" in /home/linuxbrew/*) true ;; *) false ;; esac; then
-      section "uv upgrade via brew"
-      tool_card "uv" "uv Python toolchain" "$before" "uv"
-      run_shell 'brew update && brew upgrade uv'
-      after="$(version_of uv 2>/dev/null || true)"
-      track "uv upgrade (brew)" $? "$before" "$after" "uv is managed by Homebrew on this machine"
-    else
-      section "uv self update"
-      tool_card "uv" "uv Python toolchain" "$before" "uv"
-      run_cmd uv self update
-      after="$(version_of uv 2>/dev/null || true)"
-      track "uv self update" $? "$before" "$after"
-    fi
-
-    section "uv tool upgrade"
-    tool_card "uv" "uv-installed tools"
-    local uv_tool_output
-    run_cmd_capture uv_tool_output uv tool upgrade --all
-    local uv_tool_code=$?
-    local uv_delta uv_pkg uv_old uv_new uv_env uv_note uv_forced_status
-    uv_delta="$(printf '%s\n' "$uv_tool_output" | uv_tool_delta)"
-    uv_note=""
-    uv_forced_status=""
-    if [ -n "$uv_delta" ]; then
-      IFS='|' read -r uv_pkg uv_old uv_new uv_env <<< "$uv_delta"
-      uv_note="uv updated ${uv_env:-an installed tool} environment"
-      uv_forced_status="UPDATED"
-    fi
-    if [ "$uv_tool_code" -eq 0 ] && printf '%s\n' "$uv_tool_output" | uv_output_has_stale_extra_warning; then
-      if [ -n "$uv_note" ]; then
-        uv_note="$uv_note; one installed tool also reports stale optional-extra metadata"
-      else
-        uv_note="uv completed; one installed tool reports stale optional-extra metadata"
-      fi
-      add_concern "uv tool metadata warning" "uv reported that an installed Python tool references an optional extra that no longer exists, but the tool-upgrade command still completed." "This is not an update-all failure. If it keeps appearing, reinstall or replace the specific uv tool that prints the warning."
-    fi
-    if [ -n "$uv_forced_status" ]; then
-      track "uv tool: $uv_pkg" "$uv_tool_code" "$uv_pkg $uv_old" "$uv_new" "$uv_note" "$uv_forced_status"
-    elif [ "$uv_tool_code" -eq 0 ] && [ -n "$uv_note" ]; then
-      track "uv tool upgrade" 0 "" "" "$uv_note"
-    else
-      track "uv tool upgrade" "$uv_tool_code"
-    fi
-  else
-    skip_tool "uv" "uv Python toolchain" "uv self update" "uv command not installed" "uv"
-    skip_tool "uv" "uv-installed tools" "uv tool upgrade" "uv command not installed" "uv tool upgrade --all"
-  fi
-
-  if command -v pipx >/dev/null 2>&1; then
-    before="$(version_of pipx 2>/dev/null || true)"
-    section "pipx upgrade-all"
-    tool_card "pipx" "pipx Python CLIs" "$before"
-    run_cmd pipx upgrade-all
-    after="$(version_of pipx 2>/dev/null || true)"
-    track "pipx upgrade-all" $? "$before" "$after"
-  else
-    skip_tool "pipx" "pipx Python CLIs" "pipx upgrade-all" "pipx command not installed" "pipx"
-  fi
-
-  if command -v rustup >/dev/null 2>&1; then
-    before="$(version_of rustup 2>/dev/null || true)"
-    section "rustup update"
-    tool_card "rustup" "Rust toolchains" "$before"
-    run_cmd rustup update
-    after="$(version_of rustup 2>/dev/null || true)"
-    track "rustup update" $? "$before" "$after"
-
-    before="$(version_of cargo 2>/dev/null || true)"
-    after="$(version_of cargo 2>/dev/null || true)"
-    track "cargo version" 0 "$before" "$after" "cargo is updated through rustup toolchains"
-  else
-    skip_tool "rustup" "Rust toolchains" "rustup update" "rustup command not installed" "rustup"
-    skip_tool "rustup" "cargo version" "cargo version" "rustup command not installed" "cargo"
-  fi
-
-  if command -v cargo >/dev/null 2>&1; then
-    if command -v cargo-install-update >/dev/null 2>&1; then
-      before="$(version_of cargo-install-update 2>/dev/null || true)"
-      section "cargo install-update"
-      tool_card "cargo-installed" "Cargo-installed CLIs" "$before" "cargo install-update -a"
-      run_cmd cargo install-update -a
-      after="$(version_of cargo-install-update 2>/dev/null || true)"
-      track "cargo installed CLIs" $? "$before" "$after" "updates cargo-installed binaries through the existing cargo-update helper"
-    else
-      skip_tool "cargo-installed" "Cargo-installed CLIs" "cargo installed CLIs" "cargo exists, but cargo-install-update is not installed; not installing new Rust helpers automatically" "cargo install-update -a"
-    fi
-  else
-    skip_tool "cargo-installed" "Cargo-installed CLIs" "cargo installed CLIs" "cargo command not installed" "cargo install-update -a"
-  fi
-
-  if command -v gh >/dev/null 2>&1; then
-    before="$(version_of gh 2>/dev/null || true)"
-    section "gh extension upgrade"
-    tool_card "gh" "GitHub CLI extensions" "$before"
-    run_cmd gh extension upgrade --all
-    after="$(version_of gh 2>/dev/null || true)"
-    track "gh extensions" $? "$before" "$after"
-  else
-    skip_tool "gh" "GitHub CLI extensions" "gh extensions" "gh command not installed" "gh"
-  fi
-
-  if command -v code >/dev/null 2>&1; then
-    before="$(version_of code 2>/dev/null || true)"
-    section "code extension update"
-    tool_card "code" "VS Code extensions" "$before" "code --update-extensions"
-    run_cmd code --update-extensions
-    after="$(version_of code 2>/dev/null || true)"
-    track "code extensions" $? "$before" "$after" "updates installed VS Code extensions only"
-  elif command -v codium >/dev/null 2>&1; then
-    before="$(version_of codium 2>/dev/null || true)"
-    section "codium extension update"
-    tool_card "code" "VSCodium extensions" "$before" "codium --update-extensions"
-    run_cmd codium --update-extensions
-    after="$(version_of codium 2>/dev/null || true)"
-    track "codium extensions" $? "$before" "$after" "updates installed VSCodium extensions only"
-  else
-    skip_tool "code" "Editor extensions" "editor extensions" "code/codium command not installed" "code --update-extensions"
-  fi
-
-  banner "CLEANUP"
-  section "apt autoremove + clean"
-  tool_card "cleanup" "apt cleanup"
-  printf '   %b%s%b %s\n\n' "$C_LABEL" "upfront choice" "$C_RESET" "$_ua_apt_cleanup_choice"
-  if choice_is_yes "$_ua_apt_cleanup_choice"; then
-    sudo_cmd apt-get autoremove --purge -y
-    local clean_a=$?
-    sudo_cmd apt-get autoclean
-    local clean_b=$?
-    sudo_cmd apt-get clean
-    local clean_c=$?
-    if [ "$clean_a" -eq 0 ] && [ "$clean_b" -eq 0 ] && [ "$clean_c" -eq 0 ]; then
-      track "apt autoremove" 0
-    else
-      track "apt autoremove" 1 "" "" "autoremove exit=$clean_a, autoclean exit=$clean_b, clean exit=$clean_c"
-    fi
-  else
-    skip_step "apt autoremove" "skipped by upfront choice; no packages removed or cache cleaned"
-    add_concern "Apt cleanup skipped" "No apt-owned cleanup ran, so auto-removable packages and apt download caches may remain." "This is safe. Run update-all again and answer yes to apt cleanup when you want that maintenance."
-  fi
-
-  section "workstation cache cleanup"
-  tool_card "cleanup" "workstation cache cleanup"
-  printf '   %b%s%b %s\n\n' "$C_LABEL" "upfront choice" "$C_RESET" "$_ua_workstation_cleanup_choice"
-  if choice_is_yes "$_ua_workstation_cleanup_choice"; then
-    run_workstation_cleanup
-    track "workstation cache cleanup" $? "" "" "safe cache/trash sweep; archives, LLM weights, databases, and project data are left alone"
-  else
-    skip_step "workstation cache cleanup" "skipped by upfront choice; no non-apt caches removed"
-    add_concern "Cache cleanup skipped" "No broader rebuildable cache cleanup ran, so npm/pip/browser/test caches may remain." "This is safe. Run update-all again and answer yes to workstation cache cleanup when you want to reclaim space."
-  fi
-}
-
-main() {
-  parse_args "$@"
-  color_init
   if [ "${UPDATE_ALL_PROMPT_SELFTEST:-0}" = 1 ]; then
+    discover_host
+    discover_environment
     collect_optional_choices
     printf 'firmware choice: %s\n' "$_ua_firmware_choice"
     for ((i = 0; i < ${#_ua_brew_taps[@]}; i++)); do
@@ -2323,37 +307,52 @@ main() {
     printf 'workstation cleanup choice: %s\n' "$_ua_workstation_cleanup_choice"
     return 0
   fi
+
   if [ "${UPDATE_ALL_REDACTION_SELFTEST:-0}" = 1 ]; then
     color_log_stream
     return 0
   fi
+
   if [ "${UPDATE_ALL_STDIN_SELFTEST:-0}" = 1 ]; then
     local stdin_selftest_output
-    run_cmd bash -c 'if IFS= read -r -t 0.1 _; then echo run-cmd-open; else echo run-cmd-closed; fi'
-    run_cmd_capture stdin_selftest_output bash -c 'if IFS= read -r -t 0.1 _; then echo run-capture-open; else echo run-capture-closed; fi'
-    run_bounded 2s bash -c 'if IFS= read -r -t 0.1 _; then echo run-bounded-open; else echo run-bounded-closed; fi'
-    run_shell 'if IFS= read -r -t 0.1 _; then echo run-shell-open; else echo run-shell-closed; fi'
-    run_shell_capture stdin_selftest_output 'if IFS= read -r -t 0.1 _; then echo run-shell-capture-open; else echo run-shell-capture-closed; fi'
+    run_cmd bash -c 'if IFS= read -r -t 1 _; then echo run-cmd-open; else echo run-cmd-closed; fi'
+    run_cmd_capture stdin_selftest_output bash -c 'if IFS= read -r -t 1 _; then echo run-capture-open; else echo run-capture-closed; fi'
+    run_bounded 2s bash -c 'if IFS= read -r -t 1 _; then echo run-bounded-open; else echo run-bounded-closed; fi'
+    run_shell 'if IFS= read -r -t 1 _; then echo run-shell-open; else echo run-shell-closed; fi'
+    run_shell_capture stdin_selftest_output 'if IFS= read -r -t 1 _; then echo run-shell-capture-open; else echo run-shell-capture-closed; fi'
+    if [ "${UPDATE_ALL_STDIN_INCLUDE_SUDO:-0}" = 1 ]; then
+      sudo_cmd bash -c 'if IFS= read -r -t 1 _; then echo sudo-cmd-open; else echo sudo-cmd-closed; fi'
+    fi
     : "$stdin_selftest_output"
     return 0
   fi
+
   if [ "${UPDATE_ALL_SUDO_SELFTEST:-}" = "secret-prime" ]; then
+    _ua_needs_sudo=1
     prime_sudo || return $?
     sudo_cmd printf 'sudo command ok\n'
     local sudo_selftest_code=$?
     sudo_keepalive_stop
     return "$sudo_selftest_code"
   fi
+
   if [ "${UPDATE_ALL_FIRMWARE_SELFTEST:-}" = "summary" ]; then
     local firmware_selftest_output
     firmware_selftest_output="$(cat)"
     print_firmware_summary "$firmware_selftest_output"
     return 0
   fi
+
   if [ "${UPDATE_ALL_RECEIPT_SELFTEST:-}" = "visual" ]; then
     receipt_visual_selftest
     return $?
   fi
+
+  if [ "${UPDATE_ALL_VISUAL_PREVIEW:-0}" = 1 ]; then
+    visual_preview_all
+    return $?
+  fi
+
   if [ "${UPDATE_ALL_CLASSIFY_SELFTEST:-}" = "fwupd-manual" ]; then
     fwupd_needs_manual_attention
     return $?
@@ -2370,17 +369,111 @@ main() {
     output_implies_update
     return $?
   fi
+
+  if [ -n "${UPDATE_ALL_WATCHER_SELFTEST:-}" ]; then
+    case "$UPDATE_ALL_WATCHER_SELFTEST" in
+      frames)
+        local st g
+        for st in hybrid braille anthropic; do
+          g="$(tui_watcher_glyph 0 "$st")"
+          printf 'style=%s frame0=%s\n' "$st" "$g"
+        done
+        return 0
+        ;;
+      stream-capture)
+        local cap_out="" cap_rc=0 syn_tok
+        syn_tok="sk-""1234567890abcdefghijklmno"
+        run_cmd_capture cap_out bash -c 'printf "line-one\n"; sleep 0.2; printf "token=%s\000tail\n" "$1"; exit 7' _ "$syn_tok"
+        cap_rc=$?
+        printf 'CAPTURE_RC=%s\n' "$cap_rc"
+        printf 'CAPTURE_VAL=%s\n' "$cap_out"
+        return 0
+        ;;
+      leaked-fd)
+        run_cmd bash -c '(sleep 5) & printf "parent-done\n"; exit 0'
+        return $?
+        ;;
+      pty-bar)
+        timings_set_planned_keys "selftest-step" "selftest-two"
+        tui_set_phase "TOOLS"
+        tui_init
+        tui_step_begin "selftest-step" "Testing live dock"
+        run_cmd bash -c 'printf "tick-start\n"; sleep 0.35; printf "tick-end\n"'
+        tui_step_end "selftest-step" "OK"
+        tui_teardown
+        return 0
+        ;;
+      timings)
+        timings_load
+        timings_set_planned_keys "apt-upgrade" "brew-upgrade"
+        timings_record_step "apt-upgrade" 30
+        timings_save
+        printf 'EST_APT=%s\n' "$(timings_get_estimate "apt-upgrade")"
+        return 0
+        ;;
+    esac
+  fi
+
+  if [ -n "${UPDATE_ALL_SAFETY_SELFTEST:-}" ]; then
+    case "$UPDATE_ALL_SAFETY_SELFTEST" in
+      osv)
+        scan_osv_packages
+        run_safety_coach_remedy
+        return 0
+        ;;
+      ports)
+        scan_public_ports
+        run_safety_coach_remedy
+        return 0
+        ;;
+      full)
+        scan_osv_packages
+        scan_public_ports
+        run_safety_coach_remedy
+        return 0
+        ;;
+    esac
+  fi
+
+  return 250
+}
+
+# ---------------------------------------------------------------------------
+# Main entrypoint
+# ---------------------------------------------------------------------------
+main() {
+  local st_rc
+  parse_args "$@"
+  ua_init_runtime
+  augment_safe_path
+  color_init
+  tui_query_size
+
+  _ua_run_selftests
+  st_rc=$?
+  if [ "$st_rc" -ne 250 ]; then
+    return "$st_rc"
+  fi
+
   _ua_started_s="$(date +%s)"
   _ua_started_h="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-  _ua_prev_int_trap="$(trap -p INT || true)"
-  _ua_prev_term_trap="$(trap -p TERM || true)"
 
   intro
+  tui_check_min_size
+  discover_host
+  discover_environment
+  timings_load
   collect_optional_choices
   prime_sudo || return $?
+
+  tui_init
   run_updates
   sudo_keepalive_stop
+  timings_save
+  tui_teardown
+
   report
+  run_safety_coach_remedy
   return "$rc"
 }
 
