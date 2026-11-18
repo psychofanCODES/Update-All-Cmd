@@ -115,7 +115,7 @@ _tui_watcher_glyph_var() {
   case "$tick" in *[!0-9]*|"") tick=0 ;; esac
   if [ "$style" = "off" ]; then printf -v "$__out" '%s' ""; return 0; fi
   if [ "${_ua_utf8:-1}" -eq 0 ]; then
-    local -a ascii_f=('|' '/' '-' '\')
+    local -a ascii_f=('|' '/' '-' "\\")
     printf -v "$__out" '%s' "${ascii_f[$((tick % 4))]}"; return 0
   fi
   case "$style" in
@@ -133,7 +133,7 @@ _tui_watcher_wave_var() {
   case "$tick" in *[!0-9]*|"") tick=0 ;; esac
   case "$style" in off|anthropic) printf -v "$__out" '%s' ""; return 0 ;; esac
   if [ "${_ua_utf8:-1}" -eq 0 ]; then
-    local -a aw_f=('|/-' '/-\' '-\|' '\|/')
+    local -a aw_f=('|/-' "/-\\" "-\\|" "\\|/")
     printf -v "$__out" '%s' "${aw_f[$((tick % 4))]}"; return 0
   fi
   local -a w_f=('⣿⣷⣯' '⣷⣯⣟' '⣯⣟⡿' '⣟⡿⢿' '⡿⢿⣻' '⢿⣻⣽' '⣻⣽⣾' '⣽⣾⣿')
@@ -216,10 +216,10 @@ timings_load() {
     case "$secs" in *[!0-9]*) continue ;; esac
     [ "$secs" -ge 1 ] && [ "$secs" -le 86400 ] || continue
     if _timings_find_index "$key"; then
-      _ua_timing_secs[$_ua_timing_idx]="$secs"
+      _ua_timing_secs[_ua_timing_idx]="$secs"
     else
       idx="${#_ua_timing_keys[@]}"
-      _ua_timing_keys[$idx]="$key"; _ua_timing_secs[$idx]="$secs"
+      _ua_timing_keys[idx]="$key"; _ua_timing_secs[idx]="$secs"
     fi
     _ua_timings_has_history=1
   done < "$file"
@@ -240,10 +240,10 @@ timings_record_step() {
     prev="${_ua_timing_secs[$_ua_timing_idx]}"
     ewma=$(( (prev * 6 + actual * 4) / 10 ))
     [ "$ewma" -lt 1 ] && ewma=1
-    _ua_timing_secs[$_ua_timing_idx]="$ewma"
+    _ua_timing_secs[_ua_timing_idx]="$ewma"
   else
     idx="${#_ua_timing_keys[@]}"
-    _ua_timing_keys[$idx]="$key"; _ua_timing_secs[$idx]="$actual"
+    _ua_timing_keys[idx]="$key"; _ua_timing_secs[idx]="$actual"
   fi
   _ua_timings_has_history=1
 }

@@ -1366,7 +1366,7 @@ if [ -x "$DIST_BUNDLE" ]; then
 
   dist_mode="$(stat -c '%a' "$DIST_BUNDLE" 2>/dev/null || stat -f '%Lp' "$DIST_BUNDLE" 2>/dev/null || true)"
   assert_eq "$dist_mode" "755" "dist/update-all must have 0755 permissions (world-readable executable, not 711)"
-  dist_ls_perms="$(ls -l "$DIST_BUNDLE" | awk '{print substr($1, 1, 10)}')"
+  dist_ls_perms="$(stat -c '%A' "$DIST_BUNDLE" 2>/dev/null || stat -f '%Sp' "$DIST_BUNDLE" 2>/dev/null || true)"
   assert_eq "$dist_ls_perms" "-rwxr-xr-x" "dist/update-all permissions string must be -rwxr-xr-x"
 
   dist_visual="$(read_out dist-visual)"

@@ -603,6 +603,7 @@ _ua_sudo_exec() {
     declare -F tui_pause_for_tty >/dev/null 2>&1 && tui_pause_for_tty
     printf '\n%bSudo session expired — please re-authenticate:%b\n' "${C_WARN:-}" "${C_RESET:-}" >&2
     local auth_rc=0
+    # shellcheck disable=SC2024 # Reading password from the controlling TTY is intentional.
     sudo -v </dev/tty || auth_rc=$?
     declare -F tui_resume_after_tty >/dev/null 2>&1 && tui_resume_after_tty
     if [ "$auth_rc" -ne 0 ]; then
@@ -656,6 +657,7 @@ prime_sudo() {
         "${C_BAD:-}" "${C_RESET:-}" >&2
       return 1
     fi
+    # shellcheck disable=SC2024 # Reading password from the controlling TTY is intentional.
     sudo -v </dev/tty || return $?
   fi
 

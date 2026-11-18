@@ -43,8 +43,8 @@ record_pkg_delta() {
   [ -n "$bef" ] && [ -n "$aft" ] && [ "$bef" = "$aft" ] && return 0
   for ((i = 0; i < ${#_ua_delta_pkgs[@]}; i++)); do
     if [ "${_ua_delta_pkgs[$i]}" = "$pkg" ] && [ "${_ua_delta_via[$i]}" = "$via" ]; then
-      _ua_delta_before[$i]="${bef:-${_ua_delta_before[$i]}}"
-      _ua_delta_after[$i]="${aft:-${_ua_delta_after[$i]}}"
+      _ua_delta_before[i]="${bef:-${_ua_delta_before[$i]}}"
+      _ua_delta_after[i]="${aft:-${_ua_delta_after[$i]}}"
       return 0
     fi
   done
